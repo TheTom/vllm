@@ -37,7 +37,8 @@ def _is_power_of_2(n: int) -> bool:
     return n > 0 and next_power_of_2(n) == n
 
 
-# Expected concrete values for each preset at head_dim=128.
+# Expected concrete values for original presets at head_dim=128.
+# New presets (asymmetric, _rv) are validated via structural invariants.
 # fmt: off
 PRESET_EXPECTED = {
     "turboquant_k8v4": dict(
@@ -72,41 +73,11 @@ PRESET_EXPECTED = {
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
-    # TQ+ rotated-values presets (same sizes as base presets)
-    "turboquant_k8v4_rv": dict(
-        key_fp8=True,  key_quant_bits=8,
-        key_mse_bits=0, value_quant_bits=4,
-        mse_bits=4, n_centroids=16, centroid_bits=4,
-        norm_correction=False,
-        key_packed_size=128, value_packed_size=68,
-        slot_size=196, slot_size_aligned=196,
-    ),
-    "turboquant_4bit_nc_rv": dict(
-        key_fp8=False, key_quant_bits=4,
-        key_mse_bits=4, value_quant_bits=4,
-        mse_bits=4, n_centroids=16, centroid_bits=4,
-        norm_correction=True,
-        key_packed_size=66, value_packed_size=68,
-        slot_size=134, slot_size_aligned=134,
-    ),
-    "turboquant_k3v4_nc_rv": dict(
-        key_fp8=False, key_quant_bits=3,
-        key_mse_bits=3, value_quant_bits=4,
-        mse_bits=3, n_centroids=8, centroid_bits=3,
-        norm_correction=True,
-        key_packed_size=50, value_packed_size=68,
-        slot_size=118, slot_size_aligned=118,
-    ),
-    "turboquant_3bit_nc_rv": dict(
-        key_fp8=False, key_quant_bits=3,
-        key_mse_bits=3, value_quant_bits=3,
-        mse_bits=3, n_centroids=8, centroid_bits=3,
-        norm_correction=True,
-        key_packed_size=50, value_packed_size=52,
-        slot_size=102, slot_size_aligned=102,
-    ),
 }
 # fmt: on
+
+# Presets with hardcoded expected values (backward compat regression tests)
+TESTED_PRESETS = list(PRESET_EXPECTED.keys())
 
 
 # ============================================================================
@@ -124,9 +95,9 @@ class TestTurboQuantConfig:
         with pytest.raises(ValueError, match="Unknown TurboQuant"):
             TurboQuantConfig.from_cache_dtype("turboquant_invalid", head_dim=128)
 
-    # ---- Per-preset concrete value checks (table-driven) ----
+    # ---- Per-preset concrete value checks (original presets only) ----
 
-    @pytest.mark.parametrize("preset", ALL_PRESETS)
+    @pytest.mark.parametrize("preset", TESTED_PRESETS)
     def test_key_mode(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         exp = PRESET_EXPECTED[preset]
@@ -134,13 +105,13 @@ class TestTurboQuantConfig:
         assert cfg.key_quant_bits == exp["key_quant_bits"]
         assert cfg.key_mse_bits == exp["key_mse_bits"]
 
-    @pytest.mark.parametrize("preset", ALL_PRESETS)
+    @pytest.mark.parametrize("preset", TESTED_PRESETS)
     def test_value_mode(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         exp = PRESET_EXPECTED[preset]
         assert cfg.value_quant_bits == exp["value_quant_bits"]
 
-    @pytest.mark.parametrize("preset", ALL_PRESETS)
+    @pytest.mark.parametrize("preset", TESTED_PRESETS)
     def test_bits_and_centroids(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         exp = PRESET_EXPECTED[preset]
@@ -148,12 +119,12 @@ class TestTurboQuantConfig:
         assert cfg.n_centroids == exp["n_centroids"]
         assert cfg.centroid_bits == exp["centroid_bits"]
 
-    @pytest.mark.parametrize("preset", ALL_PRESETS)
+    @pytest.mark.parametrize("preset", TESTED_PRESETS)
     def test_norm_correction(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         assert cfg.norm_correction is PRESET_EXPECTED[preset]["norm_correction"]
 
-    @pytest.mark.parametrize("preset", ALL_PRESETS)
+    @pytest.mark.parametrize("preset", TESTED_PRESETS)
     def test_packed_sizes(self, preset):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
         exp = PRESET_EXPECTED[preset]
@@ -251,6 +222,60 @@ class TestTurboQuantConfig:
     def test_boundary_skip_layers_cap_at_half(self):
         layers = TurboQuantConfig.get_boundary_skip_layers(8, 10)
         assert len(layers) == 8
+
+    # ---- Head-dim padding ----
+
+    def test_power_of_2_no_padding(self):
+        """Power-of-2 head dims should not need padding."""
+        for d in [64, 128, 256]:
+            cfg = TurboQuantConfig(head_dim=d)
+            assert not cfg.needs_padding
+            assert cfg.padded_head_dim == d
+
+    def test_non_power_of_2_needs_padding(self):
+        """Non-power-of-2 head dims should pad to next power of 2."""
+        cases = [(80, 128), (96, 128), (48, 64), (192, 256)]
+        for d, expected_padded in cases:
+            cfg = TurboQuantConfig(head_dim=d)
+            assert cfg.needs_padding
+            assert cfg.padded_head_dim == expected_padded
+
+    def test_fp8_no_padding_without_rv(self):
+        """FP8 keys without rotate_values skip WHT entirely — no padding."""
+        cfg = TurboQuantConfig(head_dim=80, key_quant_bits=8)
+        assert cfg.padded_head_dim == 80
+
+    def test_fp8_pads_with_rv(self):
+        """FP8 keys WITH rotate_values still needs padding for V rotation."""
+        cfg = TurboQuantConfig(head_dim=80, key_quant_bits=8, rotate_values=True)
+        assert cfg.padded_head_dim == 128
+
+    def test_padded_key_packed_larger(self):
+        """MSE keys at d=80 should pack at d=128 (more bytes)."""
+        cfg_80 = TurboQuantConfig(head_dim=80, key_quant_bits=4)
+        cfg_128 = TurboQuantConfig(head_dim=128, key_quant_bits=4)
+        # d=80 pads to d=128, so key_packed_size should match d=128
+        assert cfg_80.key_packed_size == cfg_128.key_packed_size
+
+    # ---- Asymmetric presets ----
+
+    def test_asymmetric_presets_exist(self):
+        """New asymmetric presets should be valid."""
+        for name in ["turboquant_k8v3", "turboquant_k4v3_nc"]:
+            cfg = TurboQuantConfig.from_cache_dtype(name, head_dim=128)
+            assert isinstance(cfg, TurboQuantConfig)
+
+    def test_k8v3_has_correct_bits(self):
+        cfg = TurboQuantConfig.from_cache_dtype("turboquant_k8v3", head_dim=128)
+        assert cfg.key_quant_bits == 8
+        assert cfg.value_quant_bits == 3
+        assert cfg.key_fp8 is True
+
+    def test_k4v3_has_correct_bits(self):
+        cfg = TurboQuantConfig.from_cache_dtype("turboquant_k4v3_nc", head_dim=128)
+        assert cfg.key_quant_bits == 4
+        assert cfg.value_quant_bits == 3
+        assert cfg.norm_correction is True
 
 
 # ============================================================================

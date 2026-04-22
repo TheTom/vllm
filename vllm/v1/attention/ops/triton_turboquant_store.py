@@ -352,17 +352,20 @@ def triton_turboquant_store(
     value: torch.Tensor,  # [N, H, D] — raw values
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, padded_slot] uint8
     slot_mapping: torch.Tensor,  # [N] int32
-    PiT: torch.Tensor,  # [D, D] float32
+    PiT: torch.Tensor,  # [D_wht, D_wht] float32 (may be padded dim)
     midpoints: torch.Tensor,  # [n_centroids-1] float32
     mse_bits: int,
     key_packed_size: int,
     value_quant_bits: int,
     key_fp8: bool = False,
     rotate_values: bool = False,
+    padded_head_dim: int = 0,
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
     NH = N * H
+    # WHT padding: expand to padded_head_dim for non-power-of-2 head dims
+    D_wht = padded_head_dim if padded_head_dim > D else D
     block_size = kv_cache.shape[1]
     BLOCK_D = triton.next_power_of_2(D)
     mse_bytes = math.ceil(D * mse_bits / 8)
@@ -386,7 +389,11 @@ def triton_turboquant_store(
         # TQ+: WHT rotation on values spreads information across dimensions,
         # improving uniform quantization quality at the same bit width.
         if rotate_values:
-            v_flat = (v_flat.float() @ PiT).to(v_flat.dtype).contiguous()
+            v_f = v_flat.float()
+            if D_wht > D:
+                v_f = torch.nn.functional.pad(v_f, (0, D_wht - D))
+            v_flat = (v_f @ PiT).to(v_flat.dtype).contiguous()
+            D = D_wht  # quantize in padded space
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
@@ -419,12 +426,18 @@ def triton_turboquant_store(
     k_flat = key.float().reshape(NH, D)
     norms = k_flat.norm(dim=1, keepdim=True)
     x_hat = k_flat / (norms + 1e-8)
+    # Pad K for WHT if head_dim is not power-of-2
+    if D_wht > D:
+        x_hat = torch.nn.functional.pad(x_hat, (0, D_wht - D))
     y = x_hat @ PiT
 
     v_flat = value.float().reshape(NH, D)
-    # TQ+: WHT rotation on values
+    # TQ+: WHT rotation on values (with padding if needed)
     if rotate_values:
+        if D_wht > D:
+            v_flat = torch.nn.functional.pad(v_flat, (0, D_wht - D))
         v_flat = (v_flat @ PiT).contiguous()
+    D = D_wht  # MSE path always uses padded dim for quantization
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)

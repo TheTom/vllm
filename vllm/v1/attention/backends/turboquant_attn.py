@@ -97,13 +97,20 @@ class TurboQuantAttentionBackend(AttentionBackend):
         torch.float16,
         torch.bfloat16,
     ]
+    # Populated from TQ_PRESETS — no need to manually maintain this list.
+    # The supports_kv_cache_dtype() override below uses prefix matching
+    # so any turboquant_* preset is accepted regardless of this list.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "turboquant_k8v4",
+        "turboquant_k8v3",
         "turboquant_4bit_nc",
+        "turboquant_k4v3_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
         "turboquant_k8v4_rv",
+        "turboquant_k8v3_rv",
         "turboquant_4bit_nc_rv",
+        "turboquant_k4v3_nc_rv",
         "turboquant_k3v4_nc_rv",
         "turboquant_3bit_nc_rv",
     ]
@@ -337,22 +344,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         flips do not improve Lloyd-Max quantization quality because the
         quantizer is symmetric around zero (sign-flipping a coordinate
         maps it to the mirror centroid with identical distortion).
+
+        For non-power-of-2 head dims (e.g. 80), the Hadamard matrix is
+        built at padded_head_dim. Padding/slicing is handled at the
+        rotation call sites in the store and decode launchers.
         """
         if not hasattr(layer, "_tq_cached"):
-            D = self.head_size
+            cfg = self.tq_config
+            # WHT dimension: padded to next power of 2 if needed
+            wht_dim = cfg.padded_head_dim
 
             # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
             # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
+            H = _build_hadamard(wht_dim, str(device))
             layer._tq_PiT = H
             layer._tq_Pi = H
             # fp16 copy for rotation in continuation prefill path
             layer._tq_Pi_half = H.to(torch.float16)
+            layer._tq_needs_padding = cfg.needs_padding
+            layer._tq_padded_dim = wht_dim
 
-            # Centroids for Lloyd-Max quantization.
-            layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
-                device=device, dtype=torch.float32
-            )
+            # Centroids for Lloyd-Max quantization (in padded WHT dim).
+            layer._tq_centroids = get_centroids(
+                wht_dim, self.tq_config.centroid_bits
+            ).to(device=device, dtype=torch.float32)
 
             c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
@@ -539,6 +554,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
             rotate_values=self.tq_config.rotate_values,
+            padded_head_dim=self.tq_config.padded_head_dim,
         )
 
     # ------------------------------------------------------------------ #
@@ -668,6 +684,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
                         rotate_values=self.tq_config.rotate_values,
+                        original_head_dim=self.head_size,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -764,12 +781,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             num_warps=4,
         )
 
-        # Inverse-rotate MSE keys back to original space
+        # Inverse-rotate MSE keys back to original space (with slice if padded)
         if not self.tq_config.key_fp8:
             # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
             Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
+            D_k = k_cached.shape[-1]
+            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D_k)
             k_flat = k_flat @ Pi_half
+            if D_k > D:
+                k_flat = k_flat[..., :D]
             k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
                 0, 1
             )  # (cached_len, Hk, D) — already fp16
@@ -781,10 +801,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Skip .contiguous() — the copy into k_full/v_full handles layout
         v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
-        # TQ+: inverse WHT on dequanted cached values
+        # TQ+: inverse WHT on dequanted cached values, then slice if padded
         if self.tq_config.rotate_values:
-            v_flat = v_cached_trim.reshape(-1, D).float()
+            D_v = v_cached_trim.shape[-1]
+            v_flat = v_cached_trim.reshape(-1, D_v).float()
             v_flat = v_flat @ Pi
+            if D_v > D:
+                v_flat = v_flat[..., :D]
             v_cached_trim = v_flat.to(torch.float16).reshape(cached_len, Hk, D)
 
         # Concatenate cached + current chunk K/V (match query dtype)
@@ -887,5 +910,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
             rotate_values=self.tq_config.rotate_values,
+            original_head_dim=self.head_size,
         )
         return result

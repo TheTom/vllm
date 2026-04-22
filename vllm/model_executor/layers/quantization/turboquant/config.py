@@ -8,55 +8,65 @@ from dataclasses import dataclass
 # Named TQ presets: each maps to frozen config parameters.
 # key_quant_bits: 8 = FP8 keys, 3-4 = MSE (Lloyd-Max) quantized keys.
 # value_quant_bits: 3-4 = uniform quantized values.
-TQ_PRESETS: dict[str, dict] = {
-    "turboquant_k8v4": {
-        "key_quant_bits": 8,
-        "value_quant_bits": 4,
-        "norm_correction": False,
-    },
-    "turboquant_4bit_nc": {
-        "key_quant_bits": 4,
-        "value_quant_bits": 4,
-        "norm_correction": True,
-    },
-    "turboquant_k3v4_nc": {
-        "key_quant_bits": 3,
-        "value_quant_bits": 4,
-        "norm_correction": True,
-    },
-    "turboquant_3bit_nc": {
-        "key_quant_bits": 3,
-        "value_quant_bits": 3,
-        "norm_correction": True,
-    },
-    # TurboQuant+ presets: WHT rotation on values before quantization.
-    # Spreads concentrated V information across dimensions, improving
-    # uniform quantization quality. One extra GEMM per layer on decode.
-    "turboquant_k8v4_rv": {
-        "key_quant_bits": 8,
-        "value_quant_bits": 4,
-        "norm_correction": False,
-        "rotate_values": True,
-    },
-    "turboquant_4bit_nc_rv": {
-        "key_quant_bits": 4,
-        "value_quant_bits": 4,
-        "norm_correction": True,
-        "rotate_values": True,
-    },
-    "turboquant_k3v4_nc_rv": {
-        "key_quant_bits": 3,
-        "value_quant_bits": 4,
-        "norm_correction": True,
-        "rotate_values": True,
-    },
-    "turboquant_3bit_nc_rv": {
-        "key_quant_bits": 3,
-        "value_quant_bits": 3,
-        "norm_correction": True,
-        "rotate_values": True,
-    },
-}
+#
+# Naming convention:
+#   turboquant_k{K}v{V}[_nc][_rv]
+#     K = key bits (3, 4, 8=FP8)
+#     V = value bits (3, 4, 8=FP8)
+#     _nc = norm correction (re-normalize centroids during dequant)
+#     _rv = rotate values (WHT on V before quantization, TQ+ extension)
+#
+# Asymmetric K/V bit widths allow trading off key precision vs value
+# precision per workload. Keys dominate attention scoring accuracy;
+# values dominate output reconstruction fidelity.
+
+
+def _build_presets() -> dict[str, dict]:
+    """Generate all valid TQ preset combinations.
+
+    Base configurations define (key_bits, value_bits, norm_correction).
+    Each base preset also generates an _rv variant with value rotation.
+    """
+    base_configs: list[tuple[int, int, bool]] = [
+        # (key_bits, value_bits, norm_correction)
+        (8, 4, False),   # FP8 keys + 4-bit values
+        (8, 3, False),   # FP8 keys + 3-bit values
+        (4, 4, True),    # 4-bit MSE keys + 4-bit values
+        (4, 3, True),    # 4-bit keys + 3-bit values
+        (3, 4, True),    # 3-bit keys + 4-bit values
+        (3, 3, True),    # 3-bit keys + 3-bit values
+    ]
+    presets: dict[str, dict] = {}
+
+    for k_bits, v_bits, nc in base_configs:
+        # Naming preserves backward compatibility with original presets:
+        #   k8v4 → turboquant_k8v4
+        #   k4v4 → turboquant_4bit  (shorthand when K==V, non-FP8)
+        #   k3v4 → turboquant_k3v4  (explicit when K!=V, non-FP8)
+        if k_bits == 8:
+            name = f"turboquant_k8v{v_bits}"
+        elif k_bits == v_bits:
+            name = f"turboquant_{k_bits}bit"
+        else:
+            name = f"turboquant_k{k_bits}v{v_bits}"
+        if nc:
+            name += "_nc"
+
+        base = {
+            "key_quant_bits": k_bits,
+            "value_quant_bits": v_bits,
+            "norm_correction": nc,
+        }
+        presets[name] = base
+        # TQ+ variant: WHT rotation on values before quantization.
+        # Spreads concentrated V information across dimensions, improving
+        # uniform quantization quality. One extra GEMM per layer on decode.
+        presets[name + "_rv"] = {**base, "rotate_values": True}
+
+    return presets
+
+
+TQ_PRESETS: dict[str, dict] = _build_presets()
 
 
 @dataclass
@@ -105,6 +115,32 @@ class TurboQuantConfig:
     rotate_values: bool = False  # TQ+: WHT rotation on V before quantization
 
     @property
+    def needs_padding(self) -> bool:
+        """Whether head_dim requires padding for WHT (non-power-of-2)."""
+        return self.head_dim > 0 and (self.head_dim & (self.head_dim - 1)) != 0
+
+    @property
+    def padded_head_dim(self) -> int:
+        """Head dimension used for WHT rotation and cache storage.
+
+        WHT (Sylvester construction) requires power-of-2 dimensions.
+        Non-power-of-2 head dims (e.g. 80, 96) are padded to the next
+        power of 2. Padding is zero-filled before rotation and sliced
+        after inverse rotation — mathematically lossless.
+
+        FP8 key mode bypasses WHT entirely, so no padding is needed.
+        """
+        if self.key_fp8 and not self.rotate_values:
+            return self.head_dim
+        if not self.needs_padding:
+            return self.head_dim
+        # Next power of 2
+        n = 1
+        while n < self.head_dim:
+            n <<= 1
+        return n
+
+    @property
     def key_fp8(self) -> bool:
         """Whether keys are stored as FP8 — no rotation/quantization needed."""
         return self.key_quant_bits == 8
@@ -144,13 +180,17 @@ class TurboQuantConfig:
         FP8 mode (key_quant_bits=8):
           head_dim bytes (1 byte per element, no overhead).
 
-        TQ mode:
-          - MSE indices: ceil(head_dim * key_mse_bits / 8) bytes
+        TQ mode (MSE keys with WHT rotation):
+          - MSE indices: ceil(padded_head_dim * key_mse_bits / 8) bytes
           - vec_norm:     2 bytes (float16)
+
+        Uses padded_head_dim because WHT rotation expands non-power-of-2
+        head dims to the next power of 2.
         """
         if self.key_fp8:
-            return self.head_dim  # 1 byte per element
-        mse_bytes = math.ceil(self.head_dim * self.key_mse_bits / 8)
+            return self.head_dim  # 1 byte per element, no rotation
+        d = self.padded_head_dim
+        mse_bytes = math.ceil(d * self.key_mse_bits / 8)
         norm_bytes = 2  # vec_norm fp16
         return mse_bytes + norm_bytes
 
@@ -163,9 +203,12 @@ class TurboQuantConfig:
     def value_packed_size(self) -> int:
         """Packed bytes for a single VALUE vector.
 
-        Uniform quantization: ceil(head_dim * bits / 8) + 4 bytes (scale + zero fp16).
+        Uniform quantization: ceil(D * bits / 8) + 4 bytes (scale + zero fp16).
+        When rotate_values is enabled, D = padded_head_dim (WHT requires
+        power-of-2). Otherwise D = head_dim.
         """
-        data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
+        d = self.padded_head_dim if self.rotate_values else self.head_dim
+        data_bytes = math.ceil(d * self.value_quant_bits / 8)
         return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
 
     @property
