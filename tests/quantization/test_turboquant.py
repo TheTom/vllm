@@ -72,6 +72,39 @@ PRESET_EXPECTED = {
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
+    # TQ+ rotated-values presets (same sizes as base presets)
+    "turboquant_k8v4_rv": dict(
+        key_fp8=True,  key_quant_bits=8,
+        key_mse_bits=0, value_quant_bits=4,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=False,
+        key_packed_size=128, value_packed_size=68,
+        slot_size=196, slot_size_aligned=196,
+    ),
+    "turboquant_4bit_nc_rv": dict(
+        key_fp8=False, key_quant_bits=4,
+        key_mse_bits=4, value_quant_bits=4,
+        mse_bits=4, n_centroids=16, centroid_bits=4,
+        norm_correction=True,
+        key_packed_size=66, value_packed_size=68,
+        slot_size=134, slot_size_aligned=134,
+    ),
+    "turboquant_k3v4_nc_rv": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=4,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=68,
+        slot_size=118, slot_size_aligned=118,
+    ),
+    "turboquant_3bit_nc_rv": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=3,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=52,
+        slot_size=102, slot_size_aligned=102,
+    ),
 }
 # fmt: on
 
@@ -170,6 +203,28 @@ class TestTurboQuantConfig:
         else:
             assert cfg.key_mse_bits > 0
             assert cfg.key_quant_bits in (3, 4)
+
+    def test_rv_presets_have_rotate_values(self):
+        """TQ+ _rv presets must set rotate_values=True."""
+        for name in ALL_PRESETS:
+            cfg = TurboQuantConfig.from_cache_dtype(name, head_dim=128)
+            if name.endswith("_rv"):
+                assert cfg.rotate_values is True, f"{name} should rotate values"
+            else:
+                assert cfg.rotate_values is False, f"{name} should not rotate values"
+
+    def test_rv_presets_same_sizes_as_base(self):
+        """_rv presets must have identical cache layout to their base."""
+        base_presets = [p for p in ALL_PRESETS if not p.endswith("_rv")]
+        for base_name in base_presets:
+            rv_name = base_name + "_rv"
+            if rv_name not in TQ_PRESETS:
+                continue
+            base = TurboQuantConfig.from_cache_dtype(base_name, head_dim=128)
+            rv = TurboQuantConfig.from_cache_dtype(rv_name, head_dim=128)
+            assert base.slot_size == rv.slot_size
+            assert base.key_packed_size == rv.key_packed_size
+            assert base.value_packed_size == rv.value_packed_size
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
     @pytest.mark.parametrize("head_dim", [64, 96, 128, 256])

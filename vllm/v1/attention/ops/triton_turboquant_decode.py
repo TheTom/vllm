@@ -503,6 +503,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    rotate_values: bool = False,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -626,5 +627,11 @@ def triton_turboquant_decode_attention(
         num_warps=4,
         num_stages=2,
     )
+
+    # TQ+: inverse WHT on accumulated values. WHT is linear so
+    # H·Σ(w_i·v_i) = Σ(w_i·H·v_i) — one GEMM undoes the V rotation.
+    if rotate_values:
+        B_out, Hq_out, D_out = output.shape
+        output = (output.reshape(-1, D_out) @ Pi).reshape(B_out, Hq_out, D_out)
 
     return output  # already in query dtype

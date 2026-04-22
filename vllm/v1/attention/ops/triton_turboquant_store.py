@@ -358,6 +358,7 @@ def triton_turboquant_store(
     key_packed_size: int,
     value_quant_bits: int,
     key_fp8: bool = False,
+    rotate_values: bool = False,
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
@@ -382,6 +383,10 @@ def triton_turboquant_store(
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
         v_flat = value.reshape(NH, D).contiguous()
+        # TQ+: WHT rotation on values spreads information across dimensions,
+        # improving uniform quantization quality at the same bit width.
+        if rotate_values:
+            v_flat = (v_flat.float() @ PiT).to(v_flat.dtype).contiguous()
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
@@ -417,6 +422,9 @@ def triton_turboquant_store(
     y = x_hat @ PiT
 
     v_flat = value.float().reshape(NH, D)
+    # TQ+: WHT rotation on values
+    if rotate_values:
+        v_flat = (v_flat @ PiT).contiguous()
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)
