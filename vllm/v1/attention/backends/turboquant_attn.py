@@ -102,6 +102,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "turboquant_k8v4_rv",
+        "turboquant_4bit_nc_rv",
+        "turboquant_k3v4_nc_rv",
+        "turboquant_3bit_nc_rv",
     ]
 
     @staticmethod
@@ -534,6 +538,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            rotate_values=self.tq_config.rotate_values,
         )
 
     # ------------------------------------------------------------------ #
@@ -662,6 +667,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        rotate_values=self.tq_config.rotate_values,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -775,6 +781,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Skip .contiguous() — the copy into k_full/v_full handles layout
         v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
+        # TQ+: inverse WHT on dequanted cached values
+        if self.tq_config.rotate_values:
+            v_flat = v_cached_trim.reshape(-1, D).float()
+            v_flat = v_flat @ Pi
+            v_cached_trim = v_flat.to(torch.float16).reshape(cached_len, Hk, D)
+
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
         qdtype = query.dtype
@@ -874,5 +886,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            rotate_values=self.tq_config.rotate_values,
         )
         return result

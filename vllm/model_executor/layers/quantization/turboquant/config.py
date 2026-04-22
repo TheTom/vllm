@@ -29,6 +29,33 @@ TQ_PRESETS: dict[str, dict] = {
         "value_quant_bits": 3,
         "norm_correction": True,
     },
+    # TurboQuant+ presets: WHT rotation on values before quantization.
+    # Spreads concentrated V information across dimensions, improving
+    # uniform quantization quality. One extra GEMM per layer on decode.
+    "turboquant_k8v4_rv": {
+        "key_quant_bits": 8,
+        "value_quant_bits": 4,
+        "norm_correction": False,
+        "rotate_values": True,
+    },
+    "turboquant_4bit_nc_rv": {
+        "key_quant_bits": 4,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+        "rotate_values": True,
+    },
+    "turboquant_k3v4_nc_rv": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+        "rotate_values": True,
+    },
+    "turboquant_3bit_nc_rv": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "rotate_values": True,
+    },
 }
 
 
@@ -75,6 +102,7 @@ class TurboQuantConfig:
     value_quant_bits: int = 4  # 3-4 = uniform quantized values
     seed: int = 42  # kept for backward compatibility; no longer used internally
     norm_correction: bool = False
+    rotate_values: bool = False  # TQ+: WHT rotation on V before quantization
 
     @property
     def key_fp8(self) -> bool:
@@ -192,4 +220,5 @@ class TurboQuantConfig:
             key_quant_bits=preset["key_quant_bits"],
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
+            rotate_values=preset.get("rotate_values", False),
         )
