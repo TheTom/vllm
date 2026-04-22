@@ -488,7 +488,7 @@ def triton_turboquant_decode_attention(
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, padded_slot] uint8
     block_table: torch.Tensor,  # [B, max_num_blocks] int32
     seq_lens: torch.Tensor,  # [B] int32
-    Pi: torch.Tensor,  # [D, D] float32
+    Pi: torch.Tensor,  # [D_wht, D_wht] float32 (may be padded dim)
     centroids: torch.Tensor,  # [n_centroids] float32
     scale: float,
     mse_bits: int,
@@ -496,7 +496,7 @@ def triton_turboquant_decode_attention(
     value_quant_bits: int,
     key_fp8: bool = False,
     norm_correction: bool = False,
-    PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous
+    PiT: torch.Tensor | None = None,  # [D_wht, D_wht] pre-computed
     # Pre-allocated buffers (optional, avoids per-call allocation)
     mid_o_buf: torch.Tensor | None = None,
     output_buf: torch.Tensor | None = None,
@@ -504,12 +504,14 @@ def triton_turboquant_decode_attention(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     rotate_values: bool = False,
+    original_head_dim: int = 0,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
     Returns: output tensor [B, Hq, D] in query's dtype.
     """
     B, Hq, D = query.shape
+    D_orig = original_head_dim if original_head_dim > 0 else D
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
@@ -520,12 +522,16 @@ def triton_turboquant_decode_attention(
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
     # FP8 path: pass query directly (float16); kernel casts inline.
     # MSE path: still needs external GEMM (cuBLAS), so q_rot is float32.
+    # For padded head dims, query is padded before rotation.
     if key_fp8:
         q_rot = query.contiguous()
     else:
         q_float = query.float()
         if PiT is None:
             PiT = Pi.T.contiguous()
+        D_wht = PiT.shape[0]
+        if D_wht > D:
+            q_float = torch.nn.functional.pad(q_float, (0, D_wht - D))
         q_rot = (q_float @ PiT).contiguous()
 
     NUM_KV_SPLITS = max_num_kv_splits
@@ -633,5 +639,9 @@ def triton_turboquant_decode_attention(
     if rotate_values:
         B_out, Hq_out, D_out = output.shape
         output = (output.reshape(-1, D_out) @ Pi).reshape(B_out, Hq_out, D_out)
+
+    # Slice back to original head_dim if padded for WHT
+    if D_orig < output.shape[-1]:
+        output = output[..., :D_orig].contiguous()
 
     return output  # already in query dtype
