@@ -805,13 +805,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
-        # Grab cached decode buffers from the layer (lazily allocated).
-        mid_o_buf = output_buf = lse_buf = None
-        if layer is not None:
-            mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
-            output_buf = getattr(layer, "_tq_output_buf", None)
-            lse_buf = getattr(layer, "_tq_lse_buf", None)
-
         result = triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
@@ -826,10 +819,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
-            mid_o_buf=mid_o_buf,
-            output_buf=output_buf,
-            lse_buf=lse_buf,
-            buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
