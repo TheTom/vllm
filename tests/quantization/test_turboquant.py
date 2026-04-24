@@ -6,6 +6,7 @@ Run: .venv/bin/python -m pytest tests/quantization/test_turboquant.py -v
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -196,6 +197,138 @@ class TestTurboQuantConfig:
     def test_boundary_skip_layers_cap_at_half(self):
         layers = TurboQuantConfig.get_boundary_skip_layers(8, 10)
         assert len(layers) == 8
+
+
+class _FakeTurboQuantAttentionInit:
+    def __init__(self, num_heads: int):
+        self.num_heads = num_heads
+
+    def register_buffer(
+        self, name: str, tensor: torch.Tensor, persistent: bool = True
+    ) -> None:
+        setattr(self, name, tensor)
+
+
+class TestTurboQuantDecodeWorkspace:
+    def test_init_turboquant_keeps_centroids_without_per_layer_scratch(
+        self, default_vllm_config
+    ):
+        from vllm.model_executor.layers.attention.attention import Attention
+
+        fake_attn = _FakeTurboQuantAttentionInit(num_heads=8)
+        Attention._init_turboquant_buffers(
+            fake_attn, "turboquant_3bit_nc", 128, "layers.0.attn"
+        )
+
+        assert hasattr(fake_attn, "_tq_centroids")
+        assert hasattr(fake_attn, "_tq_config")
+        assert not hasattr(fake_attn, "_tq_mid_o_buf")
+        assert not hasattr(fake_attn, "_tq_output_buf")
+        assert not hasattr(fake_attn, "_tq_lse_buf")
+
+    def test_decode_acquires_workspace_when_manager_is_initialized(self, monkeypatch):
+        from vllm.v1.attention.ops import triton_turboquant_decode as decode
+
+        captured = {}
+
+        class FakeWorkspaceManager:
+            def get_simultaneous(self, *shapes_and_dtypes):
+                captured["shapes_and_dtypes"] = shapes_and_dtypes
+                return (
+                    torch.empty(2, 8, 4, 129),
+                    torch.empty(2, 8, 128),
+                    torch.empty(2, 8),
+                )
+
+        monkeypatch.setattr(decode, "_get_layout", lambda *args: {"unused": True})
+        monkeypatch.setattr(
+            "vllm.v1.worker.workspace.is_workspace_manager_initialized",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "vllm.v1.worker.workspace.current_workspace_manager",
+            lambda: FakeWorkspaceManager(),
+        )
+
+        def stop_after_workspace(*args, **kwargs):
+            raise RuntimeError("workspace acquired")
+
+        monkeypatch.setattr(decode, "_use_fp8_e4b15", stop_after_workspace)
+
+        with pytest.raises(RuntimeError, match="workspace acquired"):
+            decode.triton_turboquant_decode_attention(
+                query=torch.empty(2, 8, 128),
+                kv_cache=torch.empty(1, 16, 8, 102, dtype=torch.uint8),
+                block_table=torch.zeros(2, 1, dtype=torch.int32),
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                Pi=torch.empty(128, 128),
+                centroids=torch.empty(8),
+                scale=1.0,
+                mse_bits=3,
+                key_packed_size=50,
+                value_quant_bits=3,
+                PiT=torch.empty(128, 128),
+                max_num_kv_splits=4,
+            )
+
+        assert captured["shapes_and_dtypes"] == (
+            ((2, 8, 4, 129), torch.float32),
+            ((2, 8, 128), torch.float32),
+            ((2, 8), torch.float32),
+        )
+
+    def test_capture_model_reserves_turboquant_workspace_before_early_return(self):
+        from vllm.config import CUDAGraphMode
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        calls = []
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+        runner._reserve_turboquant_decode_workspace = lambda: calls.append("reserve")
+
+        assert runner.capture_model() == 0
+        assert calls == ["reserve"]
+
+    def test_reserve_turboquant_workspace_checks_all_attention_groups(
+        self, monkeypatch
+    ):
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        captured = {}
+
+        class FakeWorkspaceManager:
+            def get_simultaneous(self, *shapes_and_dtypes):
+                captured["shapes_and_dtypes"] = shapes_and_dtypes
+
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.cache_config = SimpleNamespace(cache_dtype="turboquant_3bit_nc")
+        runner.scheduler_config = SimpleNamespace(max_num_seqs=16)
+        runner.parallel_config = SimpleNamespace(tensor_parallel_size=2)
+        runner.model_config = SimpleNamespace(
+            get_num_attention_heads=lambda parallel_config: 8,
+            get_head_size=lambda: 128,
+        )
+        runner.vllm_config = SimpleNamespace(
+            attention_config=SimpleNamespace(tq_max_kv_splits_for_cuda_graph=4)
+        )
+        flash_group = SimpleNamespace(
+            backend=SimpleNamespace(get_name=lambda: "FLASH_ATTN")
+        )
+        tq_group = SimpleNamespace(backend=SimpleNamespace(get_name=lambda: "TURBOQUANT"))
+        runner.attn_groups = [[flash_group], [tq_group]]
+
+        monkeypatch.setattr(
+            "vllm.v1.worker.gpu_model_runner.current_workspace_manager",
+            lambda: FakeWorkspaceManager(),
+        )
+
+        runner._reserve_turboquant_decode_workspace()
+
+        assert captured["shapes_and_dtypes"] == (
+            ((16, 8, 4, 129), torch.float32),
+            ((16, 8, 128), torch.float32),
+            ((16, 8), torch.float32),
+        )
 
 
 # ============================================================================

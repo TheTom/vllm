@@ -6026,6 +6026,8 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        self._reserve_turboquant_decode_workspace()
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
@@ -6061,8 +6063,6 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
-
-        self._reserve_turboquant_decode_workspace()
 
         start_time = time.perf_counter()
 
@@ -6123,25 +6123,27 @@ class GPUModelRunner(
         if not self.attn_groups:
             return
 
-        for group in self.attn_groups[0]:
-            if group.backend.get_name() != "TURBOQUANT":
-                continue
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_heads = self.model_config.get_num_attention_heads(self.parallel_config)
+        head_size = self.model_config.get_head_size()
+        max_num_splits = (
+            self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+        )
 
-            max_num_reqs = self.scheduler_config.max_num_seqs
-            num_heads = self.model_config.get_num_attention_heads(self.parallel_config)
-            head_size = self.model_config.get_head_size()
-            max_num_splits = (
-                self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
-            )
-            current_workspace_manager().get_simultaneous(
-                (
-                    (max_num_reqs, num_heads, max_num_splits, head_size + 1),
-                    torch.float32,
-                ),
-                ((max_num_reqs, num_heads, head_size), torch.float32),
-                ((max_num_reqs, num_heads), torch.float32),
-            )
-            return
+        for groups in self.attn_groups:
+            for group in groups:
+                if group.backend.get_name() != "TURBOQUANT":
+                    continue
+
+                current_workspace_manager().get_simultaneous(
+                    (
+                        (max_num_reqs, num_heads, max_num_splits, head_size + 1),
+                        torch.float32,
+                    ),
+                    ((max_num_reqs, num_heads, head_size), torch.float32),
+                    ((max_num_reqs, num_heads), torch.float32),
+                )
+                return
 
     def _warmup_and_capture(
         self,
