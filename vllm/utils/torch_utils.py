@@ -60,6 +60,19 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_k4v3_nc_cv_rv": torch.uint8,
     "turboquant_k3v4_nc_cv_rv": torch.uint8,
     "turboquant_3bit_nc_cv_rv": torch.uint8,
+    # TQ+ TURBO2_0: 2-bit support (5-7× compression at PPL cost)
+    "turboquant_2bit_nc": torch.uint8,
+    "turboquant_2bit_nc_rv": torch.uint8,
+    "turboquant_2bit_nc_cv_rv": torch.uint8,
+    "turboquant_k2v4_nc": torch.uint8,
+    "turboquant_k2v4_nc_rv": torch.uint8,
+    "turboquant_k2v4_nc_cv_rv": torch.uint8,
+    "turboquant_k4v2_nc": torch.uint8,
+    "turboquant_k4v2_nc_rv": torch.uint8,
+    "turboquant_k4v2_nc_cv_rv": torch.uint8,
+    "turboquant_k3v2_nc": torch.uint8,
+    "turboquant_k3v2_nc_rv": torch.uint8,
+    "turboquant_k3v2_nc_cv_rv": torch.uint8,
     "nvfp4": torch.uint8,
 }
 

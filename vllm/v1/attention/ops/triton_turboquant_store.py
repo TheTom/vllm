@@ -94,7 +94,7 @@ def _store_quantized_value(
             ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
         )
 
-    else:  # VQB == 4
+    elif VQB == 4:
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
         )
@@ -112,6 +112,46 @@ def _store_quantized_value(
         shifts_4 = tl.arange(0, 2) * 4
         packed_val = tl.sum((q_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
         val_offs = tl.arange(0, BLOCK_D // 2)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed_val,
+            mask=val_mask,
+        )
+
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 1,
+            ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(
+            KV_cache_ptr + slot_base + sc_offset + 3,
+            ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
+        )
+
+    else:  # VQB == 2 — 4 indices per byte (TURBO2_0)
+        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
+        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
+        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        v_scale = (val_max - val_min) / 3.0
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 3
+        )
+        # 4 indices per byte
+        q_quads = tl.reshape(q_all, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed_val = tl.sum((q_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 4)
         val_mask = val_offs < VAL_DATA_BYTES
         tl.store(
             KV_cache_ptr + slot_base + val_cache_offset + val_offs,
@@ -209,11 +249,21 @@ def _store_centroid_value(
             KV_cache_ptr + slot_base + val_cache_offset + grp_offs * 3 + 2,
             b2, mask=grp_mask,
         )
-    else:  # VQB == 4
+    elif VQB == 4:
         idx_pairs = tl.reshape(idx, [BLOCK_D // 2, 2])
         shifts_4 = tl.arange(0, 2) * 4
         packed = tl.sum((idx_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
         val_offs = tl.arange(0, BLOCK_D // 2)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed, mask=val_mask,
+        )
+    else:  # VQB == 2 — 4 indices per byte (TURBO2_0)
+        idx_quads = tl.reshape(idx, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed = tl.sum((idx_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 4)
         val_mask = val_offs < VAL_DATA_BYTES
         tl.store(
             KV_cache_ptr + slot_base + val_cache_offset + val_offs,
@@ -410,6 +460,14 @@ def _tq_fused_store_mse(
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3, b0, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
+
+    elif MSE_BITS == 2:
+        idx_quads = tl.reshape(idx, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed = tl.sum((idx_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        mse_offs = tl.arange(0, BLOCK_D // 4)
+        mse_mask = mse_offs < MSE_BYTES
+        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
 
     # ── 3. STORE vec_norm (fp16, 2 bytes) ─────────────────────────────
     norm_offset = MSE_BYTES

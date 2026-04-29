@@ -250,7 +250,7 @@ def _tq_decode_stage1(
                 other=0,
             ).to(tl.int32)
             v_idx_int = ((val_raw0 | (val_raw1 << 8)) >> val_bit_shift[None, :]) & 0x7
-        else:  # VQB == 4
+        elif VQB == 4:
             vb_idx = d_offs // 2
             vb_shift = (d_offs % 2) * 4
             val_addrs = val_bases[:, None] + vb_idx[None, :]
@@ -260,6 +260,16 @@ def _tq_decode_stage1(
                 other=0,
             ).to(tl.int32)
             v_idx_int = (val_raw >> vb_shift[None, :]) & 0xF
+        else:  # VQB == 2 — 4 indices per byte
+            vb_idx = d_offs // 4
+            vb_shift = (d_offs % 4) * 2
+            val_addrs = val_bases[:, None] + vb_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx_int = (val_raw >> vb_shift[None, :]) & 0x3
 
         # Step 2: dequantize. Centroid path: gather + multiply by norm.
         # Uniform path: index * scale + zero. Layout differs only in the
@@ -434,11 +444,18 @@ def _tq_full_dequant_kv(
             KV_cache_ptr + val_base + val_byte_idx + 1, mask=d_mask, other=0
         ).to(tl.int32)
         v_idx_int = ((val_raw0 | (val_raw1 << 8)) >> val_bit_shift) & 0x7
+    elif VQB == 2:
+        vb_idx = d_offs // 4
+        vb_shift = (d_offs % 4) * 2
+        val_raw = tl.load(
+            KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0
+        ).to(tl.int32)
+        v_idx_int = (val_raw >> vb_shift) & 0x3
     else:
         v_idx_int = tl.zeros([BLOCK_D], dtype=tl.int32)
 
     # Step 2: dequantize. Centroid (gather + norm) or uniform (scale + zero).
-    if VQB == 3 or VQB == 4:
+    if VQB == 2 or VQB == 3 or VQB == 4:
         if VALUE_CENTROID:
             v_centroid = tl.load(Centroids_ptr + v_idx_int, mask=d_mask, other=0.0)
             n_base = val_base + VAL_DATA_BYTES

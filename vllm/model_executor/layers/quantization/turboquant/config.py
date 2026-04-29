@@ -41,6 +41,13 @@ def _build_presets() -> dict[str, dict]:
         (4, 3, True),    # 4-bit keys + 3-bit values
         (3, 4, True),    # 3-bit keys + 4-bit values
         (3, 3, True),    # 3-bit keys + 3-bit values
+        # TURBO2_0: 2-bit MSE K + 2-bit uniform V. 5.6× compression vs 3.8×
+        # at 4-bit, but quality drops noticeably. Boundary-layer skip is
+        # mandatory; PPL must be validated per model before serving.
+        (2, 2, True),    # 2-bit MSE keys + 2-bit values
+        (4, 2, True),    # 4-bit keys + 2-bit values (asym, less aggressive)
+        (3, 2, True),    # 3-bit keys + 2-bit values
+        (2, 4, True),    # 2-bit keys + 4-bit values (preserves V quality)
     ]
     presets: dict[str, dict] = {}
 
@@ -104,11 +111,27 @@ class TurboQuantConfig:
     groups) found it hurts attention quality by amplifying variance through
     softmax.
 
-    Named presets (use via --kv-cache-dtype):
-        turboquant_k8v4:   FP8 keys + 4-bit values, 2.6x, +1.17% PPL
-        turboquant_4bit_nc: 4-bit MSE keys + 4-bit values + NC, 3.8x, +2.71%
-        turboquant_k3v4_nc: 3-bit MSE keys + 4-bit values + NC, ~3.5x, +10.63%
-        turboquant_3bit_nc: 3-bit MSE keys + 3-bit values + NC, 4.9x, +20.59%
+    Named presets (use via --kv-cache-dtype). PPL deltas measured on
+    Qwen3-8B / wikitext-2 test (298,862 tokens, ctx=2048, bf16 model
+    dtype, vLLM TQ+ kernel path with chunked prefill exercising the
+    quantized cache; first/last 2 layers always FP16 for boundary
+    protection, so deltas are ~89% quantized layers + 11% FP16):
+
+        turboquant_k8v4:    FP8 K + 4-bit V                  2.6× ~0% PPL
+        turboquant_4bit_nc: 4-bit MSE K + 4-bit V + NC       3.8× +0.08% PPL
+        turboquant_k3v4_nc: 3-bit MSE K + 4-bit V + NC       ~3.5× +1.13% PPL
+        turboquant_3bit_nc: 3-bit MSE K + 3-bit V + NC       4.9× +1.65% PPL
+        turboquant_2bit_nc: 2-bit MSE K + 2-bit V + NC       7.3× +4.27% PPL
+
+    All `_rv` variants (TurboQuant+ V rotation) measure essentially
+    identical to the non-rv preset on PPL — the V rotation buys
+    bandwidth savings + makes centroid-V meaningful, not raw quality.
+
+    Older (pre-2026 vLLM) docstrings cited much larger PPL deltas
+    (e.g. +20.59% for 3-bit). Those values appear to have come from
+    a different methodology or earlier kernel that lacked the
+    boundary-skip + fp32 WHT + precise Lloyd-Max centroids the
+    current implementation has.
 
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).

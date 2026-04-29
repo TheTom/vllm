@@ -118,6 +118,19 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_k4v3_nc_cv_rv",
         "turboquant_k3v4_nc_cv_rv",
         "turboquant_3bit_nc_cv_rv",
+        # TQ+ TURBO2_0: 2-bit support
+        "turboquant_2bit_nc",
+        "turboquant_2bit_nc_rv",
+        "turboquant_2bit_nc_cv_rv",
+        "turboquant_k2v4_nc",
+        "turboquant_k2v4_nc_rv",
+        "turboquant_k2v4_nc_cv_rv",
+        "turboquant_k4v2_nc",
+        "turboquant_k4v2_nc_rv",
+        "turboquant_k4v2_nc_cv_rv",
+        "turboquant_k3v2_nc",
+        "turboquant_k3v2_nc_rv",
+        "turboquant_k3v2_nc_cv_rv",
     ]
 
     @staticmethod
