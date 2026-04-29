@@ -364,10 +364,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer._tq_needs_padding = cfg.needs_padding
             layer._tq_padded_dim = wht_dim
 
-            # Centroids for Lloyd-Max quantization.
-            layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
-                device=device, dtype=torch.float32
-            )
+            # Centroids for Lloyd-Max quantization (in padded WHT dim).
+            layer._tq_centroids = get_centroids(
+                wht_dim, self.tq_config.centroid_bits
+            ).to(device=device, dtype=torch.float32)
 
             c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
