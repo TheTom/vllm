@@ -636,9 +636,11 @@ def triton_turboquant_decode_attention(
 
     # TQ+: inverse WHT on accumulated values. WHT is linear so
     # H·Σ(w_i·v_i) = Σ(w_i·H·v_i) — one GEMM undoes the V rotation.
+    # output is in query.dtype after stage2; cast Pi to match for the GEMM.
     if rotate_values:
         B_out, Hq_out, D_out = output.shape
-        output = (output.reshape(-1, D_out) @ Pi).reshape(B_out, Hq_out, D_out)
+        Pi_q = Pi.to(output.dtype)
+        output = (output.reshape(-1, D_out) @ Pi_q).reshape(B_out, Hq_out, D_out)
 
     # Slice back to original head_dim if padded for WHT
     if D_orig < output.shape[-1]:
