@@ -57,9 +57,32 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
-_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
-if _HAS_FLASH_ATTN:
+# FA varlen detection. Upstream flash-attn is the preferred path on CUDA;
+# on ROCm it requires a ~7-hour Composable Kernel build from source and is
+# almost never preinstalled. AITER ships a Triton-based FA varlen that
+# installs in seconds and runs natively on gfx942, so use it as a second-
+# level fallback. Without either, _continuation_prefill falls into a
+# PyTorch SDPA path that materialises an O(N²) attention matrix and
+# OOMs at 32K — the AITER path keeps long-context working on AMD.
+_FA_VARLEN_SOURCE = "none"
+flash_attn_varlen_func: Any = None
+if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+    _FA_VARLEN_SOURCE = "upstream"
+else:
+    try:
+        from aiter.ops.triton.mha import (  # type: ignore[import-not-found]
+            flash_attn_varlen_func as _aiter_fa_varlen,
+        )
+
+        flash_attn_varlen_func = _aiter_fa_varlen
+        _FA_VARLEN_SOURCE = "aiter"
+    except ImportError:
+        flash_attn_varlen_func = None
+
+_HAS_FLASH_ATTN = flash_attn_varlen_func is not None
+_FA_VARLEN_HAS_VERSION_KW = _FA_VARLEN_SOURCE == "upstream"
 
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -329,8 +352,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         max_seqlen_k: int,
     ) -> torch.Tensor:
         # fa_utils.get_flash_attn_version() returns None on backends that
-        # should not pass an explicit fa_version kwarg.
-        if self.fa_version is None:
+        # should not pass an explicit fa_version kwarg. AITER's FA varlen
+        # also doesn't accept fa_version, so the no-version branch covers
+        # both.
+        if self.fa_version is None or not _FA_VARLEN_HAS_VERSION_KW:
             return flash_attn_varlen_func(
                 q=q,
                 k=k,
