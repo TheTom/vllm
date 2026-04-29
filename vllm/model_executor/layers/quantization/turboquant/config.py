@@ -25,7 +25,13 @@ def _build_presets() -> dict[str, dict]:
     """Generate all valid TQ preset combinations.
 
     Base configurations define (key_bits, value_bits, norm_correction).
-    Each base preset also generates an _rv variant with value rotation.
+    Each base preset generates:
+      - _rv variant with value rotation (TQ+ extension)
+      - _cv_rv variant with centroid-quantized rotated values (TQ+ P1.2)
+
+    Centroid-V is only meaningful with value rotation, since the centroid
+    table is tuned for the post-WHT N(0, 1/d) distribution. Therefore
+    _cv variants always carry _rv.
     """
     base_configs: list[tuple[int, int, bool]] = [
         # (key_bits, value_bits, norm_correction)
@@ -61,7 +67,15 @@ def _build_presets() -> dict[str, dict]:
         # TQ+ variant: WHT rotation on values before quantization.
         # Spreads concentrated V information across dimensions, improving
         # uniform quantization quality. One extra GEMM per layer on decode.
-        presets[name + "_rv"] = {**base, "rotate_values": True}
+        rv = {**base, "rotate_values": True}
+        presets[name + "_rv"] = rv
+        # TQ+ centroid-V variant: V uses Lloyd-Max centroid indices
+        # (same table as K MSE) instead of uniform scale/zero. Saves 2 B
+        # per V vector; quality matches uniform when V distribution is
+        # close to chi-on-unit-vec (which it is post-WHT).
+        # MSE keys only (k=3,4); FP8 K + centroid V is not yet supported.
+        if k_bits != 8:
+            presets[name + "_cv_rv"] = {**rv, "value_centroid": True}
 
     return presets
 
@@ -113,6 +127,7 @@ class TurboQuantConfig:
     seed: int = 42  # kept for backward compatibility; no longer used internally
     norm_correction: bool = False
     rotate_values: bool = False  # TQ+: WHT rotation on V before quantization
+    value_centroid: bool = False  # TQ+ P1.2: centroid V instead of uniform
 
     @property
     def needs_padding(self) -> bool:
@@ -204,12 +219,14 @@ class TurboQuantConfig:
         """Packed bytes for a single VALUE vector.
 
         Uniform quantization: ceil(D * bits / 8) + 4 bytes (scale + zero fp16).
+        Centroid quantization: ceil(D * bits / 8) + 2 bytes (norm fp16 only).
         When rotate_values is enabled, D = padded_head_dim (WHT requires
         power-of-2). Otherwise D = head_dim.
         """
         d = self.padded_head_dim if self.rotate_values else self.head_dim
         data_bytes = math.ceil(d * self.value_quant_bits / 8)
-        return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
+        meta_bytes = 2 if self.value_centroid else 4
+        return data_bytes + meta_bytes
 
     @property
     def slot_size(self) -> int:
@@ -264,4 +281,5 @@ class TurboQuantConfig:
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
             rotate_values=preset.get("rotate_values", False),
+            value_centroid=preset.get("value_centroid", False),
         )

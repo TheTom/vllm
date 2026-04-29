@@ -37,6 +37,11 @@ CacheDType = Literal[
     "turboquant_k4v3_nc_rv",
     "turboquant_k3v4_nc_rv",
     "turboquant_3bit_nc_rv",
+    # TQ+ P1.2: centroid-V variants (Lloyd-Max V indices + norm fp16)
+    "turboquant_4bit_nc_cv_rv",
+    "turboquant_k4v3_nc_cv_rv",
+    "turboquant_k3v4_nc_cv_rv",
+    "turboquant_3bit_nc_cv_rv",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",

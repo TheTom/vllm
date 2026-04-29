@@ -83,6 +83,7 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    VALUE_CENTROID: tl.constexpr = 0,  # 1 = V is centroid-quantized, not uniform
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -235,6 +236,7 @@ def _tq_decode_stage1(
         # ============================================================
         val_bases = slot_bases + KPS
 
+        # Step 1: extract VQB-bit indices (same packing for centroid + uniform).
         if VQB == 3:
             val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
             val_raw0 = tl.load(
@@ -247,27 +249,7 @@ def _tq_decode_stage1(
                 mask=kv_mask[:, None] & d_mask[None, :],
                 other=0,
             ).to(tl.int32)
-            raw16 = val_raw0 | (val_raw1 << 8)
-            v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
-
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+            v_idx_int = ((val_raw0 | (val_raw1 << 8)) >> val_bit_shift[None, :]) & 0x7
         else:  # VQB == 4
             vb_idx = d_offs // 2
             vb_shift = (d_offs % 2) * 4
@@ -277,8 +259,30 @@ def _tq_decode_stage1(
                 mask=kv_mask[:, None] & d_mask[None, :],
                 other=0,
             ).to(tl.int32)
-            v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
+            v_idx_int = (val_raw >> vb_shift[None, :]) & 0xF
 
+        # Step 2: dequantize. Centroid path: gather + multiply by norm.
+        # Uniform path: index * scale + zero. Layout differs only in the
+        # post-data metadata (norm fp16 vs scale+zero fp16+fp16).
+        if VALUE_CENTROID:
+            v_centroids = tl.load(
+                Centroids_ptr + v_idx_int,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            n_bases = val_bases + VAL_DATA_BYTES
+            n_lo_v = tl.load(KV_cache_ptr + n_bases, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            n_hi_v = tl.load(KV_cache_ptr + n_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_norms = (
+                (n_lo_v | (n_hi_v << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            values = v_centroids * v_norms[:, None]
+        else:
+            v_idx = v_idx_int.to(tl.float32)
             sc_bases = val_bases + VAL_DATA_BYTES
             sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
                 tl.uint16
@@ -347,6 +351,7 @@ def _tq_full_dequant_kv(
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    VALUE_CENTROID: tl.constexpr = 0,
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
     pos = tl.program_id(0)
@@ -410,24 +415,15 @@ def _tq_full_dequant_kv(
 
     # === V dequant ===
     val_base = slot_base + KPS
+    # Step 1: extract VQB-bit indices (same packing for centroid + uniform)
     if VQB == 4:
         vb_idx = d_offs // 2
         vb_shift = (d_offs % 2) * 4
         val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
             tl.int32
         )
-        v_idx = ((val_raw >> vb_shift) & 0xF).to(tl.float32)
-
-        sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        v_vals = v_idx * v_scale + v_zero
+        v_idx_int = (val_raw >> vb_shift) & 0xF
     elif VQB == 3:
-        # 3-bit value unpack: 8 values per 3 bytes
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
@@ -437,17 +433,33 @@ def _tq_full_dequant_kv(
         val_raw1 = tl.load(
             KV_cache_ptr + val_base + val_byte_idx + 1, mask=d_mask, other=0
         ).to(tl.int32)
-        raw16_val = val_raw0 | (val_raw1 << 8)
-        v_idx = ((raw16_val >> val_bit_shift) & 0x7).to(tl.float32)
+        v_idx_int = ((val_raw0 | (val_raw1 << 8)) >> val_bit_shift) & 0x7
+    else:
+        v_idx_int = tl.zeros([BLOCK_D], dtype=tl.int32)
 
-        sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        v_vals = v_idx * v_scale + v_zero
+    # Step 2: dequantize. Centroid (gather + norm) or uniform (scale + zero).
+    if VQB == 3 or VQB == 4:
+        if VALUE_CENTROID:
+            v_centroid = tl.load(Centroids_ptr + v_idx_int, mask=d_mask, other=0.0)
+            n_base = val_base + VAL_DATA_BYTES
+            n_lo_v = tl.load(KV_cache_ptr + n_base).to(tl.uint16)
+            n_hi_v = tl.load(KV_cache_ptr + n_base + 1).to(tl.uint16)
+            v_norm_f = (
+                (n_lo_v | (n_hi_v << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            v_vals = v_centroid * v_norm_f
+        else:
+            v_idx = v_idx_int.to(tl.float32)
+            sc_base = val_base + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
+            sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+            v_scale = (
+                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
+            zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+            v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_vals = v_idx * v_scale + v_zero
     else:
         v_vals = tl.zeros([BLOCK_D], dtype=tl.float32)
 
@@ -505,6 +517,7 @@ def triton_turboquant_decode_attention(
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     rotate_values: bool = False,
     original_head_dim: int = 0,
+    value_centroid: bool = False,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -590,6 +603,7 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        VALUE_CENTROID=1 if value_centroid else 0,
         num_warps=1,
         num_stages=1,
     )

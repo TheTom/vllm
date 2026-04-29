@@ -113,6 +113,11 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_k4v3_nc_rv",
         "turboquant_k3v4_nc_rv",
         "turboquant_3bit_nc_rv",
+        # TQ+ P1.2: centroid-V variants
+        "turboquant_4bit_nc_cv_rv",
+        "turboquant_k4v3_nc_cv_rv",
+        "turboquant_k3v4_nc_cv_rv",
+        "turboquant_3bit_nc_cv_rv",
     ]
 
     @staticmethod
@@ -555,6 +560,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             rotate_values=self.tq_config.rotate_values,
             padded_head_dim=self.tq_config.padded_head_dim,
+            value_centroid=self.tq_config.value_centroid,
         )
 
     # ------------------------------------------------------------------ #
@@ -685,6 +691,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         PiT=PiT,
                         rotate_values=self.tq_config.rotate_values,
                         original_head_dim=self.head_size,
+                        value_centroid=self.tq_config.value_centroid,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -778,6 +785,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             BLOCK_D=BLOCK_D,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            VALUE_CENTROID=1 if self.tq_config.value_centroid else 0,
             num_warps=4,
         )
 
@@ -911,5 +919,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
             rotate_values=self.tq_config.rotate_values,
             original_head_dim=self.head_size,
+            value_centroid=self.tq_config.value_centroid,
         )
         return result

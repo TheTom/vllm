@@ -55,6 +55,11 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_k4v3_nc_rv": torch.uint8,
     "turboquant_k3v4_nc_rv": torch.uint8,
     "turboquant_3bit_nc_rv": torch.uint8,
+    # TQ+ P1.2: centroid-V variants (drop V scale/zero, use Lloyd-Max indices + norm)
+    "turboquant_4bit_nc_cv_rv": torch.uint8,
+    "turboquant_k4v3_nc_cv_rv": torch.uint8,
+    "turboquant_k3v4_nc_cv_rv": torch.uint8,
+    "turboquant_3bit_nc_cv_rv": torch.uint8,
     "nvfp4": torch.uint8,
 }
 
