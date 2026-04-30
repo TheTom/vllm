@@ -61,6 +61,8 @@ def measure_ppl(
     triatt_cfg: TriAttentionV3Config | None,
     gpu_mem: float,
 ) -> dict:
+    if triatt_cfg is not None:
+        install_triattention(model_path, triatt_cfg)
     print(f"# loading {kv_dtype}", file=sys.stderr, flush=True)
     t0 = time.time()
     llm = LLM(
@@ -76,10 +78,6 @@ def measure_ppl(
         max_num_batched_tokens=512,
     )
     print(f"# loaded in {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
-
-    eng = None
-    if triatt_cfg is not None:
-        eng = install_triattention(llm, triatt_cfg)
 
     tokenizer = llm.get_tokenizer()
     chunks = load_chunks("/root/wikitext-2-raw/wiki.test.raw", ctx, tokenizer)
@@ -110,10 +108,8 @@ def measure_ppl(
             total_logprob += float(entry.logprob)
             total_tokens += 1
         ppl_so_far = math.exp(-total_logprob / max(total_tokens, 1))
-        evict_rounds = eng.total_evict_rounds if eng is not None else 0
         print(
-            f"#   chunk {i+1}/{len(chunks)} ppl_so_far={ppl_so_far:.4f} "
-            f"evict_rounds={evict_rounds}",
+            f"#   chunk {i+1}/{len(chunks)} ppl_so_far={ppl_so_far:.4f}",
             file=sys.stderr,
             flush=True,
         )
@@ -121,14 +117,12 @@ def measure_ppl(
     elapsed = time.time() - t1
     avg_lp = total_logprob / total_tokens
     ppl = math.exp(-avg_lp)
-    stats = eng.stats() if eng is not None else None
     return {
         "kv": kv_dtype,
         "ctx": ctx,
         "ppl": ppl,
         "tokens": total_tokens,
         "seconds": elapsed,
-        "v3_stats": stats,
     }
 
 
@@ -164,7 +158,7 @@ def main():
             hybrid_mode=2,
         )
     print(
-        f"mode,kv,ctx,chunks,budget,prefix,window,ppl,tokens,seconds,evict_rounds",
+        "mode,kv,ctx,chunks,budget,prefix,window,ppl,tokens,seconds",
         flush=True,
     )
     result = measure_ppl(
@@ -175,15 +169,10 @@ def main():
         triatt_cfg=triatt_cfg,
         gpu_mem=args.gpu_mem,
     )
-    er = (
-        result["v3_stats"]["total_evict_rounds"]
-        if result["v3_stats"]
-        else 0
-    )
     line = (
         f"{args.mode},{kv},{args.ctx},{args.chunks},{args.budget},"
         f"{args.prefix},{args.window},{result['ppl']:.4f},{result['tokens']},"
-        f"{result['seconds']:.1f},{er}"
+        f"{result['seconds']:.1f}"
     )
     print(line, flush=True)
     if args.out != "-":

@@ -99,6 +99,9 @@ def main():
             hybrid_mode=2,
         )
 
+    if triatt_cfg is not None:
+        install_triattention(args.model, triatt_cfg)
+
     print(
         f"# loading {kv} mode={args.mode} ctx={args.ctx}",
         file=sys.stderr,
@@ -117,29 +120,21 @@ def main():
     )
     print(f"# loaded in {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
 
-    eng = None
-    if triatt_cfg is not None:
-        eng = install_triattention(llm, triatt_cfg)
-
     sp = SamplingParams(max_tokens=args.gen, temperature=0.0)
 
     positions = POSITIONS_32K if args.ctx <= 32 * 1024 else POSITIONS_64K
     pos_names = ["start", "middle", "end"]
 
-    print(f"mode,kv,ctx,position,char_pos,result,evict_rounds")
+    print("mode,kv,ctx,position,char_pos,result")
     for name, char_pos in zip(pos_names, positions):
         prompt = build_prompt(haystack, char_pos)
-        # Reset per-prompt V3 mask so each NIAH trial starts clean.
-        if eng is not None:
-            eng._seq_state.clear()
         out = llm.generate(
             [prompt], sampling_params=sp, use_tqdm=False
         )[0]
         text = out.outputs[0].text
         verdict = classify(text)
-        er = eng.total_evict_rounds if eng is not None else 0
         print(
-            f"{args.mode},{kv},{args.ctx},{name},{char_pos},{verdict},{er}",
+            f"{args.mode},{kv},{args.ctx},{name},{char_pos},{verdict}",
             flush=True,
         )
 

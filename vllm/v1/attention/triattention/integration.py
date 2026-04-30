@@ -1,6 +1,6 @@
 """Top-level entry point for installing TriAttention V3 in vLLM.
 
-Usage:
+Usage (must run BEFORE LLM() so env vars are inherited by the worker fork):
 
     from vllm import LLM
     from vllm.v1.attention.triattention import (
@@ -8,8 +8,13 @@ Usage:
         install_triattention,
     )
 
-    llm = LLM(model=..., kv_cache_dtype="auto", ...)
-    install_triattention(llm, TriAttentionV3Config(budget=29491))
+    install_triattention(
+        model_path="/path/to/Qwen2.5-7B",
+        cfg=TriAttentionV3Config(budget=29491),
+    )
+    llm = LLM(model="/path/to/Qwen2.5-7B", kv_cache_dtype="turboquant_k8v4", ...)
+    # The worker process inherits VLLM_TRIATT_* env vars and lazy-initialises
+    # the engine on the first Q-capture call.
 
 Two integration paths supported:
 
@@ -25,29 +30,28 @@ Two integration paths supported:
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-import torch
+from transformers import AutoConfig
 
-from vllm.v1.attention.triattention.engine import (
-    TriAttentionV3Config,
-    TriAttentionV3Engine,
+from vllm.v1.attention.triattention.engine import TriAttentionV3Config
+from vllm.v1.attention.triattention.hooks import (
+    export_config_to_env,
+    set_engine,
 )
-from vllm.v1.attention.triattention.hooks import set_engine
 
 
-def _resolve_model_dims(llm) -> dict:
-    """Pull architecture dims out of a vLLM LLM handle (V1 engine)."""
-    cfg = llm.llm_engine.vllm_config
-    mc = cfg.model_config
-    hf = mc.hf_text_config
-
+def _resolve_dims_from_hf(model_path: str) -> dict:
+    """Resolve attention dims from a HuggingFace model directory."""
+    hf = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if hasattr(hf, "text_config"):
+        hf = hf.text_config
     n_layers = hf.num_hidden_layers
     n_heads = hf.num_attention_heads
     n_kv_heads = getattr(hf, "num_key_value_heads", n_heads)
     head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // n_heads
     rope_theta = float(getattr(hf, "rope_theta", 10000.0))
-    # Partial RoPE: some models rotate only a fraction of head_dim
     partial = getattr(hf, "partial_rotary_factor", None)
     if partial is None:
         n_rot = head_dim
@@ -64,47 +68,51 @@ def _resolve_model_dims(llm) -> dict:
 
 
 def install_triattention(
-    llm,
+    model_path: str,
     cfg: Optional[TriAttentionV3Config] = None,
-    device: str | torch.device = "cuda",
-    dtype: torch.dtype = torch.float32,
-) -> TriAttentionV3Engine:
+) -> dict:
     """Wire the TriAttention V3 engine into a vLLM LLM instance.
 
-    Effects:
-      - Builds the engine (RoPE constants, accumulators).
-      - Installs the global hook so model attention forwards push pre-RoPE Q.
-      - Returns the engine handle (caller can read .stats() etc.).
+    vLLM V1 forks an EngineCore subprocess that owns model execution; the
+    V3 engine has to live there. This call exports model dims + cfg via
+    env vars (which the worker inherits) and the worker lazy-initialises
+    its engine on the first Q-capture.
 
-    The engine becomes active the moment install returns. Calibration runs
-    automatically once `q_samples` crosses `cfg.warmup_tokens`. Eviction is
-    triggered by a separate caller (typically the runtime after each forward
-    pass) — V3 doesn't intercept the scheduler itself.
+    Returns the resolved model dims as a dict (caller can introspect; the
+    engine handle itself lives in the worker process).
+
+    To override defaults, set VLLM_TRIATT_BUDGET / _PREFIX / _WINDOW /
+    _SEGMENTS / _WARMUP / _ADAPTIVE / _HYBRID before calling LLM(...).
     """
     cfg = cfg or TriAttentionV3Config.from_env()
-    dims = _resolve_model_dims(llm)
-    dev = torch.device(device) if isinstance(device, str) else device
-    eng = TriAttentionV3Engine(
-        cfg=cfg,
+    dims = _resolve_dims_from_hf(model_path)
+    export_config_to_env(
         n_layers=dims["n_layers"],
         n_heads=dims["n_heads"],
         n_kv_heads=dims["n_kv_heads"],
         head_dim=dims["head_dim"],
-        rope_theta=dims["rope_theta"],
         n_rot=dims["n_rot"],
-        device=dev,
-        dtype=dtype,
+        rope_theta=dims["rope_theta"],
     )
-    set_engine(eng)
+    # Echo cfg knobs into env so the worker reads the same values.
+    os.environ["VLLM_TRIATT_BUDGET"] = str(cfg.budget)
+    os.environ["VLLM_TRIATT_HYBRID"] = str(cfg.hybrid_mode)
+    os.environ["VLLM_TRIATT_PREFIX"] = str(cfg.prefix_protect)
+    os.environ["VLLM_TRIATT_WINDOW"] = str(cfg.window_size)
+    os.environ["VLLM_TRIATT_SEGMENTS"] = str(cfg.n_segments)
+    os.environ["VLLM_TRIATT_WARMUP"] = str(cfg.warmup_tokens)
     print(
-        f"[TriAttention V3] installed. "
+        f"[TriAttention V3] config exported via env vars. "
         f"layers={dims['n_layers']} heads={dims['n_heads']} kv={dims['n_kv_heads']} "
-        f"head_dim={dims['head_dim']} n_rot={dims['n_rot']} theta={dims['rope_theta']:.1f} "
-        f"budget={cfg.budget} window={cfg.window_size} prefix={cfg.prefix_protect} "
-        f"warmup={cfg.warmup_tokens}"
+        f"head_dim={dims['head_dim']} n_rot={dims['n_rot']} "
+        f"theta={dims['rope_theta']:.1f} budget={cfg.budget} "
+        f"window={cfg.window_size} prefix={cfg.prefix_protect} "
+        f"warmup={cfg.warmup_tokens}. Worker will lazy-init on first Q capture."
     )
-    return eng
+    return dims
 
 
 def uninstall_triattention() -> None:
+    """Disable V3. Effects in worker only after the next forward pass."""
+    os.environ.pop("VLLM_TRIATT_ENABLED", None)
     set_engine(None)

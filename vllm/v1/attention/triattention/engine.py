@@ -197,6 +197,11 @@ class TriAttentionV3Engine:
             self.center_imag = self.q_sum_imag * inv_n
             self.center_abs = self.q_sum_abs * inv_n
             self.calibrated = True
+            print(
+                f"[TriAttention V3] calibrated from {self.q_samples} Q samples "
+                f"({self.n_layers} layers × {self.n_kv_heads} kv-heads)",
+                flush=True,
+            )
             if not self.cfg.adaptive_calibration:
                 self.pending_uninstall = True
         else:
@@ -276,6 +281,7 @@ class TriAttentionV3Engine:
         )
         st["pending_n_blocks"] = 0
         st["pending_seq_len"] = seq_len
+        st["pending_layers"] = set()
 
     def accumulate_layer_score(
         self,
@@ -295,6 +301,13 @@ class TriAttentionV3Engine:
             return
         st = self._seq_state.get(seq_id)
         if st is None or "pending_scores" not in st:
+            return
+        # Guard against shape drift: vLLM's compile / capture / profile flow
+        # can fire continuation prefill with a K shape that doesn't match
+        # the open accumulator. Skip those layers — partial scores would
+        # corrupt the next legitimate pass. The next correctly-shaped layer
+        # will trigger a fresh begin_score_round via _v3_accumulate_prefill_k.
+        if st["pending_scores"].shape[0] != int(K.shape[0]):
             return
         scores = st["pending_scores"]
         valid = self.get_valid_mask(seq_id, scores.shape[0], scores.device)
@@ -358,6 +371,14 @@ class TriAttentionV3Engine:
         st["max_pos"] = max_pos
         st["evict_rounds"] += 1
         self.total_evict_rounds += 1
+        if self.total_evict_rounds <= 5 or self.total_evict_rounds % 10 == 0:
+            print(
+                f"[TriAttention V3] evict round {self.total_evict_rounds}: "
+                f"seq_len={seq_len} used={used} -> {used - n_evicted} (-{n_evicted}) "
+                f"max_pos={max_pos} window=[{window_thr},{seq_len}) "
+                f"prefix=[0,{prefix_lo})",
+                flush=True,
+            )
         return n_evicted
 
     # ------------------------------------------------------------------

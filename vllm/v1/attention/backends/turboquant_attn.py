@@ -140,8 +140,27 @@ def _v3_accumulate_prefill_k(
     st = eng._seq_state.get(seq_id)
     valid = eng.get_valid_mask(seq_id, seq_len, k_cached_trim.device)
 
-    # First layer of the pass: open a fresh accumulator.
-    if st is None or "pending_scores" not in st:
+    # Open a fresh accumulator on:
+    #   - the first hook call ever for this sequence
+    #   - a shape mismatch (capture/profile leftover)
+    #   - a layer that's already been accumulated this round (= next pass
+    #     started; finalise the previous round first if we have one)
+    pending_layers = st.get("pending_layers", set()) if st else set()
+    if (
+        st is not None
+        and "pending_scores" in st
+        and layer_il in pending_layers
+    ):
+        eng.finalize_evict_round(seq_id)
+        st = eng._seq_state.get(seq_id)
+        pending_layers = set()
+
+    needs_open = (
+        st is None
+        or "pending_scores" not in st
+        or st["pending_scores"].shape[0] != seq_len
+    )
+    if needs_open:
         eng.begin_score_round(seq_id, seq_len, k_cached_trim.device)
 
     # Compute max_pos / window_thr from the live mask (cheap; <O(seq_len)).
@@ -153,14 +172,13 @@ def _v3_accumulate_prefill_k(
     window_thr = max_pos - eng.cfg.window_size + 1
 
     eng.accumulate_layer_score(seq_id, layer_il, k_cached_trim, max_pos, window_thr)
-
-    # Auto-finalise once every attention layer in the model has contributed
-    # this pass. For pure transformer architectures (Qwen2/3, Llama etc.)
-    # n_layers == n_attention_layers; hybrid architectures need a separate
-    # count and aren't supported in Phase A.
     st = eng._seq_state[seq_id]
-    if st["pending_n_blocks"] >= eng.n_layers * eng.n_kv_heads:
-        eng.finalize_evict_round(seq_id)
+    if "pending_layers" in st:
+        st["pending_layers"].add(layer_il)
+    # Finalisation is deferred to the next pass start (when we see a layer
+    # that's already in pending_layers). This naturally handles boundary
+    # layers that bypass the TQ backend: we accumulate however many TQ
+    # layers fired this pass and finalise on the first layer of the next.
 
 
 def _build_triatt_valid_mask(cam, num_decodes: int) -> torch.Tensor | None:
