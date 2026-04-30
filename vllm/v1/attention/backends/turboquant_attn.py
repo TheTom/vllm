@@ -1103,10 +1103,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Hq = query.shape[1]
         Hk = kv_cache.shape[2]
         kv_group = Hq // Hk
+        # Triton requires power-of-2 ranges in tl.arange. The grouped kernel
+        # uses M_GRP = kv_group internally, so kv_group must be a power of 2.
+        # Qwen2.5-7B has kv_group = 28 / 4 = 7 which fails compilation.
+        kv_group_is_pow2 = kv_group > 0 and (kv_group & (kv_group - 1)) == 0
         sparse_v_active = _tq_sparse_v_enabled(attn_metadata.max_seq_len)
         use_grouped = (
             _TQ_GROUPED_DECODE
             and kv_group > 1
+            and kv_group_is_pow2
             and not self.tq_config.key_fp8
             and self.tq_config.effective_value_quant_bits == 4
         )

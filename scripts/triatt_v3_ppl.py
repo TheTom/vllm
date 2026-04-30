@@ -50,11 +50,17 @@ V3_MODES = {"v3", "stack", "stack_variant"}
 
 
 def load_chunks(path: str, ctx: int, tokenizer):
+    """Slice non-overlapping chunks of (ctx - 1) tokens each.
+
+    We hold one slot back so the total prompt + 1 output token fits
+    inside max_model_len = ctx. Keeps us under the model's native cap.
+    """
     text = open(path).read()
     ids = tokenizer.encode(text, add_special_tokens=False)
+    chunk_len = ctx - 1
     chunks = []
-    for i in range(0, len(ids) - ctx, ctx):
-        chunks.append(ids[i : i + ctx])
+    for i in range(0, len(ids) - chunk_len, chunk_len):
+        chunks.append(ids[i : i + chunk_len])
     return chunks
 
 
@@ -74,7 +80,9 @@ def measure_ppl(
         model=model_path,
         dtype="bfloat16",
         kv_cache_dtype=kv_dtype,
-        max_model_len=ctx + 16,
+        # Use ctx exactly. Some models (e.g. Qwen2.5-7B) cap native context
+        # at 32768; adding headroom would trip vLLM's max-len validation.
+        max_model_len=ctx,
         gpu_memory_utilization=gpu_mem,
         disable_log_stats=True,
         enable_prefix_caching=False,
