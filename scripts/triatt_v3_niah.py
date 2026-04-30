@@ -119,7 +119,7 @@ def main():
         )
 
     if triatt_cfg is not None:
-        install_triattention(args.model, triatt_cfg)
+        install_triattention(triatt_cfg)
 
     print(
         f"# loading {kv} mode={args.mode} ctx={args.ctx}",

@@ -73,7 +73,7 @@ def measure_ppl(
     gpu_mem: float,
 ) -> dict:
     if triatt_cfg is not None:
-        install_triattention(model_path, triatt_cfg)
+        install_triattention(triatt_cfg)
     print(f"# loading {kv_dtype}", file=sys.stderr, flush=True)
     t0 = time.time()
     llm = LLM(

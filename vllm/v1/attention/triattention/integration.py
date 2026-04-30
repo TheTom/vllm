@@ -1,121 +1,88 @@
 """Top-level entry point for installing TriAttention V3 in vLLM.
 
-Usage (must run BEFORE LLM() so env vars are inherited by the worker fork):
+V3 is enabled per-process via env vars. The worker inherits them from the
+parent fork and lazy-initialises its engine on the first Q-capture call,
+reading model dims from the active VllmConfig and tuning knobs from
+VLLM_TRIATT_* env vars.
+
+Two equivalent ways to enable:
+
+1. Set env vars before constructing LLM():
+
+    VLLM_TRIATT_ENABLED=1 \
+    VLLM_TRIATT_BUDGET=29491 \
+    VLLM_TRIATT_PREFIX=128 \
+    python my_script.py
+
+2. Use the helper, which sets the same env vars from a config object:
 
     from vllm import LLM
     from vllm.v1.attention.triattention import (
-        TriAttentionV3Config,
-        install_triattention,
+        TriAttentionV3Config, install_triattention,
     )
+    install_triattention(TriAttentionV3Config(budget=29491))
+    llm = LLM(model="/path/to/Qwen2.5-7B", kv_cache_dtype="turboquant_k8v4")
 
-    install_triattention(
-        model_path="/path/to/Qwen2.5-7B",
-        cfg=TriAttentionV3Config(budget=29491),
-    )
-    llm = LLM(model="/path/to/Qwen2.5-7B", kv_cache_dtype="turboquant_k8v4", ...)
-    # The worker process inherits VLLM_TRIATT_* env vars and lazy-initialises
-    # the engine on the first Q-capture call.
+The helper must run before LLM() so the worker fork inherits the env vars.
 
-Two integration paths supported:
+Tuning knobs (all integer / boolean unless noted):
+  VLLM_TRIATT_ENABLED   - master switch ("0" / "1", default "0")
+  VLLM_TRIATT_BUDGET    - max live cells per sequence (default 2048)
+  VLLM_TRIATT_HYBRID    - V1 / V2 / V3 selection mode (default 2 = V3)
+  VLLM_TRIATT_PREFIX    - protected prefix length, V3 only (default 128)
+  VLLM_TRIATT_WINDOW    - protected recent window length (default 128)
+  VLLM_TRIATT_SEGMENTS  - per-segment quota bucket count (default 8)
+  VLLM_TRIATT_WARMUP    - Q samples before calibration fires (default 1024)
+  VLLM_TRIATT_ADAPTIVE  - update calibration centers via EMA each round
+                          ("0" / "1", default "0")
 
-  1. **BF16 KV cache** (Phase A path): no kernel changes needed for scoring;
-     V3 reads K directly from the cache via the engine's own dequant. Eviction
-     applies a per-position validity mask via attention metadata. The mask is
-     consumed by the TurboQuant backend (we add VALID_MASK there); on the
-     stock BF16 path the mask is currently approximated by writing -inf into
-     evicted slots' K-norm — Phase A defers this to a follow-up if needed.
-
-  2. **TQ+ KV cache** (Phase C path): K is quantized but readable via the
-     existing TQ+ K dequant helper. V3 reads K through that path.
+V3 only composes with KV-cache presets that store K in a dequant-able
+form. The validated path is `kv_cache_dtype="turboquant_k8v4"` (FP8 K +
+4-bit V), which mirrors the K=q8_0 + V=turbo3 config the V3 paper validated
+on llama.cpp. Pure-BF16 K is not yet supported because it bypasses the
+TurboQuant attention backend where the V3 hooks live.
 """
 from __future__ import annotations
 
 import os
 from typing import Optional
 
-from transformers import AutoConfig
-
 from vllm.logger import init_logger
 from vllm.v1.attention.triattention.engine import TriAttentionV3Config
-from vllm.v1.attention.triattention.hooks import (
-    export_config_to_env,
-    set_engine,
-)
+from vllm.v1.attention.triattention.hooks import ENV_ENABLED, set_engine
 
 logger = init_logger(__name__)
 
 
-def _resolve_dims_from_hf(model_path: str) -> dict:
-    """Resolve attention dims from a HuggingFace model directory."""
-    hf = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    if hasattr(hf, "text_config"):
-        hf = hf.text_config
-    n_layers = hf.num_hidden_layers
-    n_heads = hf.num_attention_heads
-    n_kv_heads = getattr(hf, "num_key_value_heads", n_heads)
-    head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // n_heads
-    rope_theta = float(getattr(hf, "rope_theta", 10000.0))
-    partial = getattr(hf, "partial_rotary_factor", None)
-    if partial is None:
-        n_rot = head_dim
-    else:
-        n_rot = int(round(head_dim * float(partial)))
-    return {
-        "n_layers": n_layers,
-        "n_heads": n_heads,
-        "n_kv_heads": n_kv_heads,
-        "head_dim": head_dim,
-        "rope_theta": rope_theta,
-        "n_rot": n_rot,
-    }
-
-
 def install_triattention(
-    model_path: str,
     cfg: Optional[TriAttentionV3Config] = None,
-) -> dict:
-    """Wire the TriAttention V3 engine into a vLLM LLM instance.
+) -> None:
+    """Mark TriAttention V3 enabled and export tuning knobs as env vars.
 
-    vLLM V1 forks an EngineCore subprocess that owns model execution; the
-    V3 engine has to live there. This call exports model dims + cfg via
-    env vars (which the worker inherits) and the worker lazy-initialises
-    its engine on the first Q-capture.
-
-    Returns the resolved model dims as a dict (caller can introspect; the
-    engine handle itself lives in the worker process).
-
-    To override defaults, set VLLM_TRIATT_BUDGET / _PREFIX / _WINDOW /
-    _SEGMENTS / _WARMUP / _ADAPTIVE / _HYBRID before calling LLM(...).
+    Must run before constructing the vLLM `LLM(...)` instance so the
+    EngineCore subprocess fork inherits the env vars. Model dims are
+    resolved inside the worker from the active VllmConfig, so no model
+    path is required here.
     """
     cfg = cfg or TriAttentionV3Config.from_env()
-    dims = _resolve_dims_from_hf(model_path)
-    export_config_to_env(
-        n_layers=dims["n_layers"],
-        n_heads=dims["n_heads"],
-        n_kv_heads=dims["n_kv_heads"],
-        head_dim=dims["head_dim"],
-        n_rot=dims["n_rot"],
-        rope_theta=dims["rope_theta"],
-    )
-    # Echo cfg knobs into env so the worker reads the same values.
+    os.environ[ENV_ENABLED] = "1"
     os.environ["VLLM_TRIATT_BUDGET"] = str(cfg.budget)
     os.environ["VLLM_TRIATT_HYBRID"] = str(cfg.hybrid_mode)
     os.environ["VLLM_TRIATT_PREFIX"] = str(cfg.prefix_protect)
     os.environ["VLLM_TRIATT_WINDOW"] = str(cfg.window_size)
     os.environ["VLLM_TRIATT_SEGMENTS"] = str(cfg.n_segments)
     os.environ["VLLM_TRIATT_WARMUP"] = str(cfg.warmup_tokens)
+    if cfg.adaptive_calibration:
+        os.environ["VLLM_TRIATT_ADAPTIVE"] = "1"
     logger.info(
-        "TriAttention V3 config exported. layers=%d heads=%d kv=%d "
-        "head_dim=%d n_rot=%d theta=%.1f budget=%d window=%d prefix=%d "
-        "warmup=%d. Worker will lazy-init on first Q capture.",
-        dims["n_layers"], dims["n_heads"], dims["n_kv_heads"],
-        dims["head_dim"], dims["n_rot"], dims["rope_theta"],
-        cfg.budget, cfg.window_size, cfg.prefix_protect, cfg.warmup_tokens,
+        "TriAttention V3 enabled. budget=%d hybrid=%d prefix=%d window=%d "
+        "segments=%d warmup=%d. Worker will lazy-init on first Q capture.",
+        cfg.budget, cfg.hybrid_mode, cfg.prefix_protect, cfg.window_size,
+        cfg.n_segments, cfg.warmup_tokens,
     )
-    return dims
 
 
 def uninstall_triattention() -> None:
-    """Disable V3. Effects in worker only after the next forward pass."""
-    os.environ.pop("VLLM_TRIATT_ENABLED", None)
+    """Disable V3 for this process. Worker takes effect on next pass."""
+    os.environ.pop(ENV_ENABLED, None)
     set_engine(None)

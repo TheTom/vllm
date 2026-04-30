@@ -2,7 +2,7 @@
 
 The engine needs the *pre-RoPE* Q tensor at every attention layer. vLLM's
 attention layer (`vllm.model_executor.layers.attention.Attention.forward`)
-receives Q *after* RoPE, so the capture has to live earlier — inside the
+receives Q *after* RoPE, so the capture has to live earlier, inside the
 model's attention block, just before its `rotary_emb(...)` call.
 
 Mirrors the llama.cpp impl, which emits Q via the ggml scheduler's eval
@@ -15,11 +15,14 @@ callback. This module exposes a tiny explicit-emit API:
     q, k = self.rotary_emb(positions, q, k)
 
 vLLM V1 forks an EngineCore subprocess for model execution, so the engine
-must live in the worker. `install_triattention` from the main process sets
-env vars (`VLLM_TRIATT_*`); the worker lazy-initialises its engine instance
-on the first Q-capture call, reading config from those env vars.
+must live in the worker. The worker lazy-initialises its engine on the
+first Q-capture call. Model dims (n_layers, heads, kv_heads, head_dim,
+rope_theta) are read from the active `VllmConfig` so the user doesn't
+have to pass them. Tuning knobs (budget, prefix, window, etc.) come from
+VLLM_TRIATT_* env vars (see `TriAttentionV3Config.from_env`).
 
-When V3 is not enabled (no env var), the call is a tight no-op.
+When V3 is not enabled (`VLLM_TRIATT_ENABLED != "1"`), `capture_q_pre_rope`
+is a tight no-op.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from typing import Optional
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.triattention.engine import (
     TriAttentionV3Config,
@@ -35,12 +39,6 @@ from vllm.v1.attention.triattention.engine import (
 )
 
 ENV_ENABLED = "VLLM_TRIATT_ENABLED"
-ENV_N_LAYERS = "VLLM_TRIATT_N_LAYERS"
-ENV_N_HEADS = "VLLM_TRIATT_N_HEADS"
-ENV_N_KV_HEADS = "VLLM_TRIATT_N_KV_HEADS"
-ENV_HEAD_DIM = "VLLM_TRIATT_HEAD_DIM"
-ENV_N_ROT = "VLLM_TRIATT_N_ROT"
-ENV_ROPE_THETA = "VLLM_TRIATT_ROPE_THETA"
 
 logger = init_logger(__name__)
 
@@ -62,39 +60,60 @@ def is_enabled() -> bool:
     return _engine is not None or os.environ.get(ENV_ENABLED, "0") == "1"
 
 
-def export_config_to_env(
-    n_layers: int,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    n_rot: int,
-    rope_theta: float,
-) -> None:
-    """Called by install_triattention in the main process."""
-    os.environ[ENV_ENABLED] = "1"
-    os.environ[ENV_N_LAYERS] = str(n_layers)
-    os.environ[ENV_N_HEADS] = str(n_heads)
-    os.environ[ENV_N_KV_HEADS] = str(n_kv_heads)
-    os.environ[ENV_HEAD_DIM] = str(head_dim)
-    os.environ[ENV_N_ROT] = str(n_rot)
-    os.environ[ENV_ROPE_THETA] = str(rope_theta)
+def _resolve_dims_from_vllm_config() -> Optional[dict]:
+    """Pull architecture dims out of the active VllmConfig.
+
+    Called from inside the worker on first Q capture. Returns None if
+    vllm_config isn't available (engine init bails in that case).
+    """
+    vllm_cfg = get_current_vllm_config()
+    if vllm_cfg is None:
+        return None
+    hf = vllm_cfg.model_config.hf_text_config
+    n_layers = hf.num_hidden_layers
+    n_heads = hf.num_attention_heads
+    n_kv_heads = getattr(hf, "num_key_value_heads", n_heads)
+    head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // n_heads
+    rope_theta = float(getattr(hf, "rope_theta", 10000.0))
+    partial = getattr(hf, "partial_rotary_factor", None)
+    n_rot = head_dim if partial is None else int(round(head_dim * float(partial)))
+    return {
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "rope_theta": rope_theta,
+        "n_rot": n_rot,
+    }
 
 
-def _lazy_init_from_env(device: torch.device) -> None:
-    """Worker-side: build engine on first Q capture, reading env vars."""
+def _lazy_init(device: torch.device) -> None:
+    """Worker-side: build engine on first Q capture.
+
+    Tuning config comes from VLLM_TRIATT_* env vars
+    (see TriAttentionV3Config.from_env). Model dims come from the active
+    VllmConfig.
+    """
     global _engine, _lazy_init_attempted
     _lazy_init_attempted = True
     if os.environ.get(ENV_ENABLED, "0") != "1":
         return
+    dims = _resolve_dims_from_vllm_config()
+    if dims is None:
+        logger.warning(
+            "TriAttention V3 enabled but VllmConfig is not available at first "
+            "Q-capture; engine will not initialise."
+        )
+        return
     cfg = TriAttentionV3Config.from_env()
     _engine = TriAttentionV3Engine(
         cfg=cfg,
-        n_layers=int(os.environ[ENV_N_LAYERS]),
-        n_heads=int(os.environ[ENV_N_HEADS]),
-        n_kv_heads=int(os.environ[ENV_N_KV_HEADS]),
-        head_dim=int(os.environ[ENV_HEAD_DIM]),
-        rope_theta=float(os.environ[ENV_ROPE_THETA]),
-        n_rot=int(os.environ[ENV_N_ROT]),
+        n_layers=dims["n_layers"],
+        n_heads=dims["n_heads"],
+        n_kv_heads=dims["n_kv_heads"],
+        head_dim=dims["head_dim"],
+        rope_theta=dims["rope_theta"],
+        n_rot=dims["n_rot"],
         device=device,
     )
     logger.info(
@@ -116,7 +135,7 @@ def _capture_q_impl(q: torch.Tensor, layer_idx: int) -> None:
     if _engine is None:
         if _lazy_init_attempted:
             return
-        _lazy_init_from_env(q.device)
+        _lazy_init(q.device)
         if _engine is None:
             return
     eng = _engine
