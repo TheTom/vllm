@@ -50,6 +50,7 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
     triton_turboquant_decode_attention,
+    triton_turboquant_decode_attention_grouped,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
 from vllm.v1.worker.workspace import (
@@ -107,6 +108,14 @@ _TQ_SPARSE_V_THRESHOLD = float(_os.environ.get("VLLM_TQ_SPARSE_V_THRESHOLD", "0.
 _TQ_SPARSE_V_CTX_THRESHOLD = int(
     _os.environ.get("VLLM_TQ_SPARSE_V_CTX_THRESHOLD", "8192")
 )
+
+# Grouped (batched-Q) decode kernel: each program handles M_GRP queries
+# that share a kv_head, sharing K/V loads across the GQA group. Microbench
+# shows 1.62× speedup at 16K decode for Qwen3-30B-A3B (Hq=32, Hk=4 → M_GRP=8).
+# The grouped kernel only supports the slice we have validated:
+# MSE K + 4-bit V, with optional NC + centroid V. Falls back to the
+# single-Q kernel for FP8 K, 2-bit/3-bit V, or sparse V (orthogonal).
+_TQ_GROUPED_DECODE = _os.environ.get("VLLM_TQ_GROUPED_DECODE", "1") == "1"
 
 
 def _tq_sparse_v_enabled(max_seq_len: int) -> bool:
@@ -974,7 +983,42 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             )
 
-        result = triton_turboquant_decode_attention(
+        # Grouped kernel covers MSE K + 4-bit V (with NC and/or centroid V).
+        # Falls back to single-Q kernel for FP8 K, 2-bit/3-bit V, or when
+        # sparse V is engaged (sparse V is orthogonal — single-Q only).
+        Hq = query.shape[1]
+        Hk = kv_cache.shape[2]
+        kv_group = Hq // Hk
+        sparse_v_active = _tq_sparse_v_enabled(attn_metadata.max_seq_len)
+        use_grouped = (
+            _TQ_GROUPED_DECODE
+            and kv_group > 1
+            and not self.tq_config.key_fp8
+            and self.tq_config.effective_value_quant_bits == 4
+            and not sparse_v_active
+        )
+
+        if use_grouped:
+            return triton_turboquant_decode_attention_grouped(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                Pi=Pi,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                norm_correction=self.tq_config.norm_correction,
+                value_centroid=self.tq_config.value_centroid,
+                PiT=PiT,
+                max_num_kv_splits=self.max_num_kv_splits,
+                rotate_values=self.tq_config.rotate_values,
+                original_head_dim=self.head_size,
+            )
+
+        return triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,
@@ -996,7 +1040,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             rotate_values=self.tq_config.rotate_values,
             original_head_dim=self.head_size,
             value_centroid=self.tq_config.value_centroid,
-            sparse_v=_tq_sparse_v_enabled(attn_metadata.max_seq_len),
+            sparse_v=sparse_v_active,
             sparse_v_threshold=_TQ_SPARSE_V_THRESHOLD,
         )
-        return result

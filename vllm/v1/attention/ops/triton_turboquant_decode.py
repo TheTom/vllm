@@ -706,3 +706,372 @@ def triton_turboquant_decode_attention(
         output = output[..., :D_orig].contiguous()
 
     return output  # already in query dtype
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — grouped variant (P3.4 / P3.2 foundation)
+#
+# Processes M_GRP queries per program, sharing one kv_head's K/V loads
+# across the group. Score reduction becomes a tl.dot which engages MFMA
+# when M_GRP × HEAD_DIM × BLOCK_KV align with gfx942 tile sizes (≥16 each).
+# At M_GRP=KV_GROUP_SIZE this naturally batches all queries that map to
+# the same kv_head via GQA.
+#
+# Minimum-viable scope (this version):
+#   - MSE K only (no FP8 K)
+#   - VQB == 4 only (no 2/3-bit)
+#   - No NORM_CORRECTION
+#   - No VALUE_CENTROID (uniform V scale+zero only)
+#   - No SPARSE_V
+# Expand once correctness holds at M_GRP > 1.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _tq_decode_stage1_grouped(
+    Q_rot_ptr,              # [B, Hq, D] float32 (post-rotation)
+    KV_cache_ptr,           # [num_blocks, block_size, Hk, padded_slot] uint8
+    Block_table_ptr,        # [B, max_blocks] int32
+    Seq_lens_ptr,           # [B] int32
+    Centroids_ptr,          # [n_centroids] float32
+    Mid_o_ptr,              # [B, Hq, NUM_KV_SPLITS, D+1] float32
+    stride_qb,
+    stride_qh,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    stride_bt_b,
+    stride_mid_b,
+    stride_mid_h,
+    stride_mid_s,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    MSE_BITS: tl.constexpr,
+    MSE_BYTES: tl.constexpr,
+    KPS: tl.constexpr,
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    ATTN_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    M_GRP: tl.constexpr,    # queries per program
+    NORM_CORRECTION: tl.constexpr = 0,
+    VALUE_CENTROID: tl.constexpr = 0,
+):
+    bid = tl.program_id(0)         # batch
+    grp_id = tl.program_id(1)      # which kv-head-group (== kv_head when M_GRP=KV_GROUP_SIZE)
+    sid = tl.program_id(2)         # kv split
+
+    # M_GRP queries map to one kv_head. q_head_start is the first q_head idx.
+    kv_head = grp_id
+    q_head_start = grp_id * M_GRP
+
+    seq_len = tl.load(Seq_lens_ptr + bid)
+    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+    split_start = split_len * sid
+    split_end = tl.minimum(split_start + split_len, seq_len)
+    if split_start >= split_end:
+        return
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+    kv_range = tl.arange(0, BLOCK_KV)
+    m_range = tl.arange(0, M_GRP)
+
+    # Load Q tile [M_GRP, BLOCK_D]
+    q_rot = tl.load(
+        Q_rot_ptr
+        + bid * stride_qb
+        + (q_head_start + m_range[:, None]) * stride_qh
+        + d_offs[None, :],
+        mask=d_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    # Zero out padding columns so tl.dot doesn't see junk
+    q_rot = tl.where(d_mask[None, :], q_rot, 0.0)
+
+    # MSE bit/byte indices
+    mse_bit_off = d_offs * MSE_BITS
+    mse_byte_idx = mse_bit_off // 8
+    mse_bit_shift = mse_bit_off % 8
+    mse_mask = (1 << MSE_BITS) - 1
+
+    # Online softmax state — per row (M_GRP)
+    m_prev = tl.full([M_GRP], -float("inf"), dtype=tl.float32)
+    l_prev = tl.zeros([M_GRP], dtype=tl.float32)
+    acc = tl.zeros([M_GRP, BLOCK_D], dtype=tl.float32)
+
+    bt_base = bid * stride_bt_b
+
+    for start_n in range(split_start, split_end, BLOCK_KV):
+        kv_offs = start_n + kv_range
+        kv_mask = kv_offs < split_end
+        page_idx = kv_offs // BLOCK_SIZE
+        page_off = kv_offs % BLOCK_SIZE
+        block_nums = tl.load(
+            Block_table_ptr + bt_base + page_idx, mask=kv_mask, other=0
+        ).to(tl.int64)
+        slot_bases = (
+            block_nums * stride_cache_block
+            + page_off.to(tl.int64) * stride_cache_pos
+            + tl.cast(kv_head, tl.int64) * stride_cache_head
+        )
+
+        # ---------------- K MSE unpack [BLOCK_KV, BLOCK_D] ----------------
+        mse_addrs0 = slot_bases[:, None] + mse_byte_idx[None, :]
+        mse_raw0 = tl.load(
+            KV_cache_ptr + mse_addrs0,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0,
+        ).to(tl.int32)
+        mse_raw1 = tl.load(
+            KV_cache_ptr + mse_addrs0 + 1,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0,
+        ).to(tl.int32)
+        raw16 = mse_raw0 | (mse_raw1 << 8)
+        mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
+        c_vals = tl.load(
+            Centroids_ptr + mse_idx,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        if NORM_CORRECTION:
+            c_norm_sq = tl.sum(
+                tl.where(d_mask[None, :], c_vals * c_vals, 0.0), axis=1
+            )
+            c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
+            c_vals = c_vals * c_inv_norm[:, None]
+        c_vals = tl.where(d_mask[None, :], c_vals, 0.0)
+
+        # Per-vector norms [BLOCK_KV]
+        norm_bases = slot_bases + MSE_BYTES
+        n_lo = tl.load(KV_cache_ptr + norm_bases, mask=kv_mask, other=0).to(tl.uint16)
+        n_hi = tl.load(KV_cache_ptr + norm_bases + 1, mask=kv_mask, other=0).to(
+            tl.uint16
+        )
+        vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+
+        # Q · C^T → [M_GRP, BLOCK_KV], scale + multiply by per-key norm
+        # tl.dot expects f16/bf16 inputs for MFMA; we keep f32 and accept FMA.
+        scores = tl.dot(q_rot, tl.trans(c_vals)) * vec_norms[None, :] * ATTN_SCALE
+        scores = tl.where(kv_mask[None, :], scores, -float("inf"))
+
+        # ---------------- Online softmax (per row) ----------------
+        score_max = tl.max(scores, axis=1)               # [M_GRP]
+        n_e_max = tl.maximum(score_max, m_prev)          # [M_GRP]
+        re_scale = tl.exp(m_prev - n_e_max)              # [M_GRP]
+        p = tl.exp(scores - n_e_max[:, None])            # [M_GRP, BLOCK_KV]
+        l_prev = l_prev * re_scale + tl.sum(p, axis=1)
+        m_prev = n_e_max
+
+        # ---------------- V load (4-bit indices) ----------------
+        val_bases = slot_bases + KPS
+        vb_idx = d_offs // 2
+        vb_shift = (d_offs % 2) * 4
+        val_addrs = val_bases[:, None] + vb_idx[None, :]
+        val_raw = tl.load(
+            KV_cache_ptr + val_addrs,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0,
+        ).to(tl.int32)
+        v_idx_int = (val_raw >> vb_shift[None, :]) & 0xF
+
+        if VALUE_CENTROID:
+            # Centroid V: gather centroids, multiply by per-vector norm
+            v_centroids = tl.load(
+                Centroids_ptr + v_idx_int,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            n_bases = val_bases + VAL_DATA_BYTES
+            n_lo_v = tl.load(KV_cache_ptr + n_bases, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            n_hi_v = tl.load(KV_cache_ptr + n_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_norms = (
+                (n_lo_v | (n_hi_v << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            values = v_centroids * v_norms[:, None]
+        else:
+            v_idx = v_idx_int.to(tl.float32)
+            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(tl.uint16)
+            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_scales = (
+                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+        values = tl.where(d_mask[None, :], values, 0.0)
+
+        # acc [M_GRP, D] += p [M_GRP, BLOCK_KV] @ V [BLOCK_KV, D]
+        acc = acc * re_scale[:, None] + tl.dot(p, values)
+
+    # Output: M_GRP rows
+    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
+    out = acc / safe_l[:, None]
+    out_base = (
+        bid * stride_mid_b
+        + (q_head_start + m_range[:, None]) * stride_mid_h
+        + sid * stride_mid_s
+    )
+    tl.store(Mid_o_ptr + out_base + d_offs[None, :], out, mask=d_mask[None, :])
+    lse = m_prev + tl.log(safe_l)
+    out_lse_base = (
+        bid * stride_mid_b
+        + (q_head_start + m_range) * stride_mid_h
+        + sid * stride_mid_s
+        + HEAD_DIM
+    )
+    tl.store(Mid_o_ptr + out_lse_base, lse)
+
+
+def triton_turboquant_decode_attention_grouped(
+    query: torch.Tensor,             # [B, Hq, D]
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    Pi: torch.Tensor,
+    centroids: torch.Tensor,
+    scale: float,
+    mse_bits: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    norm_correction: bool = False,
+    value_centroid: bool = False,
+    PiT: torch.Tensor | None = None,
+    max_num_kv_splits: int = 32,
+    rotate_values: bool = False,
+    original_head_dim: int = 0,
+    m_grp: int | None = None,
+) -> torch.Tensor:
+    """Batched-Q variant of triton_turboquant_decode_attention.
+
+    Each kernel program processes M_GRP queries that share a kv_head
+    (M_GRP defaults to KV_GROUP_SIZE so all queries within a program
+    map to the same kv head via GQA — letting one K/V load serve the
+    whole group).
+
+    Restricted scope:
+      - MSE K only (no FP8 K)
+      - VQB == 4 only (no 2-bit, no 3-bit)
+      - No SPARSE_V (orthogonal optimization)
+      - M_GRP == KV_GROUP_SIZE
+    Supports NORM_CORRECTION and VALUE_CENTROID.
+    """
+    assert mse_bits in (3, 4) and value_quant_bits == 4, (
+        f"grouped path only supports MSE K + 4-bit V (got mse_bits={mse_bits}, "
+        f"value_quant_bits={value_quant_bits})"
+    )
+    B, Hq, D = query.shape
+    D_orig = original_head_dim if original_head_dim > 0 else D
+    Hk = kv_cache.shape[2]
+    block_size = kv_cache.shape[1]
+    kv_group_size = Hq // Hk
+    if m_grp is None:
+        m_grp = kv_group_size
+    assert m_grp == kv_group_size, (
+        "current grouped impl requires M_GRP == KV_GROUP_SIZE so a program's "
+        f"queries all share one kv_head (got M_GRP={m_grp}, KV_GROUP_SIZE={kv_group_size})"
+    )
+    device = query.device
+
+    cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
+
+    # Q rotation: same as the non-grouped path.
+    q_float = query.float()
+    if PiT is None:
+        PiT = Pi.T.contiguous()
+    D_wht = PiT.shape[0]
+    if D_wht > D:
+        q_float = torch.nn.functional.pad(q_float, (0, D_wht - D))
+    q_rot = (q_float @ PiT).contiguous()
+
+    NUM_KV_SPLITS = max_num_kv_splits
+    mid_o = torch.empty(B, Hq, NUM_KV_SPLITS, D + 1, dtype=torch.float32, device=device)
+
+    # Grid: (B, num_kv_heads, NUM_KV_SPLITS) — each program handles M_GRP q heads
+    grid = (B, Hk, NUM_KV_SPLITS)
+    BLOCK_KV = 16  # MFMA-aligned (M_GRP=8 × BLOCK_KV=16 × HEAD_DIM=128 — 2 of 3 dims are 16+)
+    _tq_decode_stage1_grouped[grid](
+        q_rot,
+        kv_cache,
+        block_table,
+        seq_lens,
+        centroids,
+        mid_o,
+        q_rot.stride(0),
+        q_rot.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        block_table.stride(0),
+        mid_o.stride(0),
+        mid_o.stride(1),
+        mid_o.stride(2),
+        NUM_KV_HEADS=Hk,
+        HEAD_DIM=D,
+        BLOCK_SIZE=block_size,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        KV_GROUP_SIZE=kv_group_size,
+        MSE_BITS=mse_bits,
+        MSE_BYTES=cfg["mse_bytes"],
+        KPS=key_packed_size,
+        VQB=value_quant_bits,
+        VAL_DATA_BYTES=cfg["val_data_bytes"],
+        ATTN_SCALE=scale,
+        BLOCK_D=cfg["BLOCK_D"],
+        BLOCK_KV=BLOCK_KV,
+        M_GRP=m_grp,
+        NORM_CORRECTION=1 if norm_correction else 0,
+        VALUE_CENTROID=1 if value_centroid else 0,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Stage 2: reuse existing reduction kernel (same mid_o layout)
+    out_dtype = query.dtype
+    output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
+    lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+
+    grid2 = (B, Hq)
+    _fwd_kernel_stage2[grid2](
+        mid_o,
+        output,
+        lse,
+        seq_lens,
+        mid_o.stride(0),
+        mid_o.stride(1),
+        mid_o.stride(2),
+        output.stride(0),
+        output.stride(1),
+        lse.stride(0),
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        BLOCK_DV=cfg["BLOCK_D"],
+        Lv=D,
+        OUTPUT_FP16=1 if out_dtype == torch.float16 else 0,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    if rotate_values:
+        B_out, Hq_out, D_out = output.shape
+        Pi_q = Pi.to(output.dtype)
+        output = (output.reshape(-1, D_out) @ Pi_q).reshape(B_out, Hq_out, D_out)
+    if D_orig < output.shape[-1]:
+        output = output[..., :D_orig].contiguous()
+    return output
