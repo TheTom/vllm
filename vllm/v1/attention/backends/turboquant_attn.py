@@ -984,8 +984,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         # Grouped kernel covers MSE K + 4-bit V (with NC and/or centroid V).
-        # Falls back to single-Q kernel for FP8 K, 2-bit/3-bit V, or when
-        # sparse V is engaged (sparse V is orthogonal — single-Q only).
+        # Falls back to single-Q kernel for FP8 K or 2-bit/3-bit V.
+        # Sparse V composes with grouped (orthogonal optimization).
         Hq = query.shape[1]
         Hk = kv_cache.shape[2]
         kv_group = Hq // Hk
@@ -995,7 +995,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             and kv_group > 1
             and not self.tq_config.key_fp8
             and self.tq_config.effective_value_quant_bits == 4
-            and not sparse_v_active
         )
 
         if use_grouped:
@@ -1016,6 +1015,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_num_kv_splits=self.max_num_kv_splits,
                 rotate_values=self.tq_config.rotate_values,
                 original_head_dim=self.head_size,
+                sparse_v=sparse_v_active,
+                sparse_v_threshold=_TQ_SPARSE_V_THRESHOLD,
             )
 
         return triton_turboquant_decode_attention(

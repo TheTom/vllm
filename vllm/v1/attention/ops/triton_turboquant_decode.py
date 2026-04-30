@@ -720,10 +720,7 @@ def triton_turboquant_decode_attention(
 # Minimum-viable scope (this version):
 #   - MSE K only (no FP8 K)
 #   - VQB == 4 only (no 2/3-bit)
-#   - No NORM_CORRECTION
-#   - No VALUE_CENTROID (uniform V scale+zero only)
-#   - No SPARSE_V
-# Expand once correctness holds at M_GRP > 1.
+# Supported: NORM_CORRECTION, VALUE_CENTROID, SPARSE_V.
 # ---------------------------------------------------------------------------
 
 
@@ -760,6 +757,8 @@ def _tq_decode_stage1_grouped(
     M_GRP: tl.constexpr,    # queries per program
     NORM_CORRECTION: tl.constexpr = 0,
     VALUE_CENTROID: tl.constexpr = 0,
+    SPARSE_V: tl.constexpr = 0,
+    SPARSE_V_THRESHOLD: tl.constexpr = 0.1,
 ):
     bid = tl.program_id(0)         # batch
     grp_id = tl.program_id(1)      # which kv-head-group (== kv_head when M_GRP=KV_GROUP_SIZE)
@@ -868,58 +867,78 @@ def _tq_decode_stage1_grouped(
         l_prev = l_prev * re_scale + tl.sum(p, axis=1)
         m_prev = n_e_max
 
-        # ---------------- V load (4-bit indices) ----------------
-        val_bases = slot_bases + KPS
-        vb_idx = d_offs // 2
-        vb_shift = (d_offs % 2) * 4
-        val_addrs = val_bases[:, None] + vb_idx[None, :]
-        val_raw = tl.load(
-            KV_cache_ptr + val_addrs,
-            mask=kv_mask[:, None] & d_mask[None, :],
-            other=0,
-        ).to(tl.int32)
-        v_idx_int = (val_raw >> vb_shift[None, :]) & 0xF
+        # Sparse V tile-skip: if max softmax mass in this tile (across all
+        # M_GRP queries and BLOCK_KV positions) is below threshold, the V
+        # contribution from this tile is negligible. Skip the V load +
+        # dequant + accumulator update; just decay acc by re_scale.
+        skip_v_tile = False
+        if SPARSE_V:
+            skip_v_tile = tl.max(p) < SPARSE_V_THRESHOLD
 
-        if VALUE_CENTROID:
-            # Centroid V: gather centroids, multiply by per-vector norm
-            v_centroids = tl.load(
-                Centroids_ptr + v_idx_int,
-                mask=kv_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            n_bases = val_bases + VAL_DATA_BYTES
-            n_lo_v = tl.load(KV_cache_ptr + n_bases, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            n_hi_v = tl.load(KV_cache_ptr + n_bases + 1, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_norms = (
-                (n_lo_v | (n_hi_v << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            values = v_centroids * v_norms[:, None]
+        if skip_v_tile:
+            acc = acc * re_scale[:, None]
         else:
-            v_idx = v_idx_int.to(tl.float32)
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(tl.uint16)
-            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
-        values = tl.where(d_mask[None, :], values, 0.0)
+            # ---------------- V load (4-bit indices) ----------------
+            val_bases = slot_bases + KPS
+            vb_idx = d_offs // 2
+            vb_shift = (d_offs % 2) * 4
+            val_addrs = val_bases[:, None] + vb_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx_int = (val_raw >> vb_shift[None, :]) & 0xF
 
-        # acc [M_GRP, D] += p [M_GRP, BLOCK_KV] @ V [BLOCK_KV, D]
-        acc = acc * re_scale[:, None] + tl.dot(p, values)
+            if VALUE_CENTROID:
+                v_centroids = tl.load(
+                    Centroids_ptr + v_idx_int,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                n_bases = val_bases + VAL_DATA_BYTES
+                n_lo_v = tl.load(KV_cache_ptr + n_bases, mask=kv_mask, other=0).to(
+                    tl.uint16
+                )
+                n_hi_v = tl.load(
+                    KV_cache_ptr + n_bases + 1, mask=kv_mask, other=0
+                ).to(tl.uint16)
+                v_norms = (
+                    (n_lo_v | (n_hi_v << 8))
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                values = v_centroids * v_norms[:, None]
+            else:
+                v_idx = v_idx_int.to(tl.float32)
+                sc_bases = val_bases + VAL_DATA_BYTES
+                sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
+                    tl.uint16
+                )
+                sc_hi = tl.load(
+                    KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0
+                ).to(tl.uint16)
+                v_scales = (
+                    (sc_lo | (sc_hi << 8))
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                zr_lo = tl.load(
+                    KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0
+                ).to(tl.uint16)
+                zr_hi = tl.load(
+                    KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0
+                ).to(tl.uint16)
+                v_zeros = (
+                    (zr_lo | (zr_hi << 8))
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                values = v_idx * v_scales[:, None] + v_zeros[:, None]
+            values = tl.where(d_mask[None, :], values, 0.0)
+
+            # acc [M_GRP, D] += p [M_GRP, BLOCK_KV] @ V [BLOCK_KV, D]
+            acc = acc * re_scale[:, None] + tl.dot(p, values)
 
     # Output: M_GRP rows
     safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
@@ -958,6 +977,8 @@ def triton_turboquant_decode_attention_grouped(
     rotate_values: bool = False,
     original_head_dim: int = 0,
     m_grp: int | None = None,
+    sparse_v: bool = False,
+    sparse_v_threshold: float = 0.1,
 ) -> torch.Tensor:
     """Batched-Q variant of triton_turboquant_decode_attention.
 
@@ -969,9 +990,8 @@ def triton_turboquant_decode_attention_grouped(
     Restricted scope:
       - MSE K only (no FP8 K)
       - VQB == 4 only (no 2-bit, no 3-bit)
-      - No SPARSE_V (orthogonal optimization)
       - M_GRP == KV_GROUP_SIZE
-    Supports NORM_CORRECTION and VALUE_CENTROID.
+    Supports NORM_CORRECTION, VALUE_CENTROID, and SPARSE_V.
     """
     assert mse_bits in (3, 4) and value_quant_bits == 4, (
         f"grouped path only supports MSE K + 4-bit V (got mse_bits={mse_bits}, "
@@ -1039,6 +1059,8 @@ def triton_turboquant_decode_attention_grouped(
         M_GRP=m_grp,
         NORM_CORRECTION=1 if norm_correction else 0,
         VALUE_CENTROID=1 if value_centroid else 0,
+        SPARSE_V=1 if sparse_v else 0,
+        SPARSE_V_THRESHOLD=sparse_v_threshold,
         num_warps=4,
         num_stages=2,
     )
