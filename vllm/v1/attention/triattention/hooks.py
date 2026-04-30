@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.attention.triattention.engine import (
     TriAttentionV3Config,
     TriAttentionV3Engine,
@@ -40,6 +41,8 @@ ENV_N_KV_HEADS = "VLLM_TRIATT_N_KV_HEADS"
 ENV_HEAD_DIM = "VLLM_TRIATT_HEAD_DIM"
 ENV_N_ROT = "VLLM_TRIATT_N_ROT"
 ENV_ROPE_THETA = "VLLM_TRIATT_ROPE_THETA"
+
+logger = init_logger(__name__)
 
 # Module-level singleton engine (one per process).
 _engine: Optional[TriAttentionV3Engine] = None
@@ -94,13 +97,12 @@ def _lazy_init_from_env(device: torch.device) -> None:
         n_rot=int(os.environ[ENV_N_ROT]),
         device=device,
     )
-    print(
-        f"[TriAttention V3] worker init. layers={_engine.n_layers} "
-        f"heads={_engine.n_heads} kv={_engine.n_kv_heads} "
-        f"head_dim={_engine.head_dim} n_rot={_engine.n_rot} "
-        f"theta={_engine.rope_theta:.1f} budget={cfg.budget} "
-        f"window={cfg.window_size} prefix={cfg.prefix_protect} "
-        f"warmup={cfg.warmup_tokens}"
+    logger.info(
+        "TriAttention V3 worker init: layers=%d heads=%d kv=%d head_dim=%d "
+        "n_rot=%d theta=%.1f budget=%d window=%d prefix=%d warmup=%d",
+        _engine.n_layers, _engine.n_heads, _engine.n_kv_heads,
+        _engine.head_dim, _engine.n_rot, _engine.rope_theta,
+        cfg.budget, cfg.window_size, cfg.prefix_protect, cfg.warmup_tokens,
     )
 
 

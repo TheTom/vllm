@@ -35,11 +35,14 @@ from typing import Optional
 
 from transformers import AutoConfig
 
+from vllm.logger import init_logger
 from vllm.v1.attention.triattention.engine import TriAttentionV3Config
 from vllm.v1.attention.triattention.hooks import (
     export_config_to_env,
     set_engine,
 )
+
+logger = init_logger(__name__)
 
 
 def _resolve_dims_from_hf(model_path: str) -> dict:
@@ -101,13 +104,13 @@ def install_triattention(
     os.environ["VLLM_TRIATT_WINDOW"] = str(cfg.window_size)
     os.environ["VLLM_TRIATT_SEGMENTS"] = str(cfg.n_segments)
     os.environ["VLLM_TRIATT_WARMUP"] = str(cfg.warmup_tokens)
-    print(
-        f"[TriAttention V3] config exported via env vars. "
-        f"layers={dims['n_layers']} heads={dims['n_heads']} kv={dims['n_kv_heads']} "
-        f"head_dim={dims['head_dim']} n_rot={dims['n_rot']} "
-        f"theta={dims['rope_theta']:.1f} budget={cfg.budget} "
-        f"window={cfg.window_size} prefix={cfg.prefix_protect} "
-        f"warmup={cfg.warmup_tokens}. Worker will lazy-init on first Q capture."
+    logger.info(
+        "TriAttention V3 config exported. layers=%d heads=%d kv=%d "
+        "head_dim=%d n_rot=%d theta=%.1f budget=%d window=%d prefix=%d "
+        "warmup=%d. Worker will lazy-init on first Q capture.",
+        dims["n_layers"], dims["n_heads"], dims["n_kv_heads"],
+        dims["head_dim"], dims["n_rot"], dims["rope_theta"],
+        cfg.budget, cfg.window_size, cfg.prefix_protect, cfg.warmup_tokens,
     )
     return dims
 

@@ -15,16 +15,18 @@ Per-sequence runtime state:
 """
 from __future__ import annotations
 
-import math
 import os
 import threading
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.attention.triattention.policy import select_v3_evictions
 from vllm.v1.attention.triattention.scoring import score_cells_torch
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -197,10 +199,10 @@ class TriAttentionV3Engine:
             self.center_imag = self.q_sum_imag * inv_n
             self.center_abs = self.q_sum_abs * inv_n
             self.calibrated = True
-            print(
-                f"[TriAttention V3] calibrated from {self.q_samples} Q samples "
-                f"({self.n_layers} layers × {self.n_kv_heads} kv-heads)",
-                flush=True,
+            logger.info(
+                "TriAttention V3 calibrated from %d Q samples "
+                "(%d layers x %d kv-heads)",
+                self.q_samples, self.n_layers, self.n_kv_heads,
             )
             if not self.cfg.adaptive_calibration:
                 self.pending_uninstall = True
@@ -372,12 +374,11 @@ class TriAttentionV3Engine:
         st["evict_rounds"] += 1
         self.total_evict_rounds += 1
         if self.total_evict_rounds <= 5 or self.total_evict_rounds % 10 == 0:
-            print(
-                f"[TriAttention V3] evict round {self.total_evict_rounds}: "
-                f"seq_len={seq_len} used={used} -> {used - n_evicted} (-{n_evicted}) "
-                f"max_pos={max_pos} window=[{window_thr},{seq_len}) "
-                f"prefix=[0,{prefix_lo})",
-                flush=True,
+            logger.info(
+                "TriAttention V3 evict round %d: seq_len=%d used=%d -> %d (-%d) "
+                "max_pos=%d window=[%d,%d) prefix=[0,%d)",
+                self.total_evict_rounds, seq_len, used, used - n_evicted,
+                n_evicted, max_pos, window_thr, seq_len, prefix_lo,
             )
         return n_evicted
 
