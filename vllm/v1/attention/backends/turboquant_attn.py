@@ -84,6 +84,44 @@ else:
 _HAS_FLASH_ATTN = flash_attn_varlen_func is not None
 _FA_VARLEN_HAS_VERSION_KW = _FA_VARLEN_SOURCE == "upstream"
 
+# Sparse V (P3.1): skip the per-tile V load + dequant when a tile's
+# softmax probability is entirely below threshold. The if/else inside
+# the kernel adds a small per-tile overhead, so the win only emerges
+# once the cache is large enough that the savings amortise it.
+#
+# Default-on above _TQ_SPARSE_V_CTX_THRESHOLD, off below. Threshold
+# 0.1 was tuned by ablation on Qwen3-30B-A3B at MI300X — gives
+# +3.7% at 16K and +6.6% at 32K decode with no quality regression
+# on short-prompt greedy. Wider thresholds (0.2-0.5) deliver more
+# perf at increasing risk to long-context quality; users can override.
+#
+# All settings overridable per-process via env var:
+#   VLLM_TQ_SPARSE_V        ("auto", "1", "0"; default "auto" =
+#                            on iff seq_len ≥ ctx threshold)
+#   VLLM_TQ_SPARSE_V_THRESHOLD  (default 0.1)
+#   VLLM_TQ_SPARSE_V_CTX_THRESHOLD  (default 8192)
+import os as _os  # noqa: E402
+
+_TQ_SPARSE_V_MODE = _os.environ.get("VLLM_TQ_SPARSE_V", "auto").lower()
+_TQ_SPARSE_V_THRESHOLD = float(_os.environ.get("VLLM_TQ_SPARSE_V_THRESHOLD", "0.1"))
+_TQ_SPARSE_V_CTX_THRESHOLD = int(
+    _os.environ.get("VLLM_TQ_SPARSE_V_CTX_THRESHOLD", "8192")
+)
+
+
+def _tq_sparse_v_enabled(max_seq_len: int) -> bool:
+    """Decide whether to engage sparse V for this forward pass.
+
+    'auto' mode (default) gates on context length so the if/else
+    overhead in the kernel only kicks in when the cache is big
+    enough for the savings to pay for it.
+    """
+    if _TQ_SPARSE_V_MODE == "1":
+        return True
+    if _TQ_SPARSE_V_MODE == "0":
+        return False
+    return max_seq_len >= _TQ_SPARSE_V_CTX_THRESHOLD
+
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
@@ -958,5 +996,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             rotate_values=self.tq_config.rotate_values,
             original_head_dim=self.head_size,
             value_centroid=self.tq_config.value_centroid,
+            sparse_v=_tq_sparse_v_enabled(attn_metadata.max_seq_len),
+            sparse_v_threshold=_TQ_SPARSE_V_THRESHOLD,
         )
         return result
