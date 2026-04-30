@@ -49,6 +49,10 @@ def _tq_decode_stage1(
     # Block table and sequence info
     Block_table_ptr,  # [B, max_num_blocks] int32
     Seq_lens_ptr,  # [B] int32
+    # TriAttention V3 valid mask (uint8 [B, max_seq_len], 1=live, 0=evicted).
+    # Pointer is unused when VALID_MASK=0 (constexpr); ignored at runtime.
+    Valid_mask_ptr,  # [B, max_seq_len] uint8 or null
+    stride_vm_b,     # bytes per row of the valid_mask (== max_seq_len)
     # TQ parameters
     Centroids_ptr,  # [n_centroids] float32
     # Output (intermediate for stage2)
@@ -86,6 +90,7 @@ def _tq_decode_stage1(
     VALUE_CENTROID: tl.constexpr = 0,  # 1 = V is centroid-quantized, not uniform
     SPARSE_V: tl.constexpr = 0,  # 1 = skip V load+accum for tiles with max_p < threshold
     SPARSE_V_THRESHOLD: tl.constexpr = 0.001,
+    VALID_MASK: tl.constexpr = 0,  # 1 = read Valid_mask_ptr to mask evicted positions
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -225,6 +230,13 @@ def _tq_decode_stage1(
 
             scores = vec_norms * term1 * ATTN_SCALE
             scores = tl.where(kv_mask, scores, -float("inf"))
+
+        # TriAttention V3: drop scores at evicted positions to -inf so the
+        # softmax sees them as zero contribution. Mask is per (batch, position).
+        if VALID_MASK:
+            vm_addr = bid * stride_vm_b + kv_offs
+            vm = tl.load(Valid_mask_ptr + vm_addr, mask=kv_mask, other=0).to(tl.int32)
+            scores = tl.where(vm > 0, scores, -float("inf"))
 
         # ============================================================
         # ONLINE SOFTMAX UPDATE (block-level)
@@ -561,8 +573,12 @@ def triton_turboquant_decode_attention(
     value_centroid: bool = False,
     sparse_v: bool = False,
     sparse_v_threshold: float = 0.001,
+    valid_mask: torch.Tensor | None = None,  # uint8 [B, max_seq_len], 1=live
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
+
+    `valid_mask` is the TriAttention V3 per-position validity mask. When
+    provided, evicted positions (mask == 0) score -inf at attention time.
 
     Returns: output tensor [B, Hq, D] in query's dtype.
     """
@@ -614,11 +630,22 @@ def triton_turboquant_decode_attention(
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
+    if valid_mask is not None:
+        vm_tensor = valid_mask
+        vm_stride_b = valid_mask.stride(0)
+        valid_mask_flag = 1
+    else:
+        vm_tensor = q_rot  # dummy; constexpr gate skips reads
+        vm_stride_b = 0
+        valid_mask_flag = 0
+
     _tq_decode_stage1[grid](
         q_rot,
         kv_cache,
         block_table,
         seq_lens,
+        vm_tensor,
+        vm_stride_b,
         centroids,
         mid_o,
         q_rot.stride(0),
@@ -649,6 +676,7 @@ def triton_turboquant_decode_attention(
         VALUE_CENTROID=1 if value_centroid else 0,
         SPARSE_V=1 if sparse_v else 0,
         SPARSE_V_THRESHOLD=sparse_v_threshold,
+        VALID_MASK=valid_mask_flag,
         num_warps=1,
         num_stages=1,
     )

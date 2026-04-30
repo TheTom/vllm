@@ -57,6 +57,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.v1.attention.triattention.hooks import capture_q_pre_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -339,6 +340,7 @@ class Qwen3MoeAttention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self._triatt_layer_idx = extract_layer_index(prefix)
 
     def forward(
         self,
@@ -355,6 +357,8 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
+        # TriAttention V3 Q capture (pre-RoPE). No-op when V3 is disabled.
+        capture_q_pre_rope(self._triatt_layer_idx, q)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
