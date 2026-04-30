@@ -53,8 +53,10 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     triton_turboquant_decode_attention_grouped,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
-from vllm.v1.attention.triattention.hooks import get_engine as _get_triatt_engine
-from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.attention.triattention.backend_helpers import (
+    accumulate_prefill_k as _v3_accumulate_prefill_k,
+    build_valid_mask as _build_triatt_valid_mask,
+)
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -118,93 +120,6 @@ _TQ_SPARSE_V_CTX_THRESHOLD = int(
 # MSE K + 4-bit V, with optional NC + centroid V. Falls back to the
 # single-Q kernel for FP8 K, 2-bit/3-bit V, or sparse V (orthogonal).
 _TQ_GROUPED_DECODE = _os.environ.get("VLLM_TQ_GROUPED_DECODE", "1") == "1"
-
-
-def _v3_accumulate_prefill_k(
-    eng,
-    layer_name: str,
-    k_cached_trim: torch.Tensor,
-    cached_len: int,
-) -> None:
-    """Push one attention layer's dequant'd K into the V3 engine.
-
-    Starts a new score round on the first attention layer of a pass, then
-    accumulates contributions until every attention layer has reported, at
-    which point V3 selection runs and the valid mask is updated. Phase A
-    scope: single-sequence batch (seq_id=0).
-    """
-    layer_il = extract_layer_index(layer_name)
-    seq_id = 0
-    seq_len = cached_len
-
-    st = eng._seq_state.get(seq_id)
-    valid = eng.get_valid_mask(seq_id, seq_len, k_cached_trim.device)
-
-    # Open a fresh accumulator on:
-    #   - the first hook call ever for this sequence
-    #   - a shape mismatch (capture/profile leftover)
-    #   - a layer that's already been accumulated this round (= next pass
-    #     started; finalise the previous round first if we have one)
-    pending_layers = st.get("pending_layers", set()) if st else set()
-    if (
-        st is not None
-        and "pending_scores" in st
-        and layer_il in pending_layers
-    ):
-        eng.finalize_evict_round(seq_id)
-        st = eng._seq_state.get(seq_id)
-        pending_layers = set()
-
-    needs_open = (
-        st is None
-        or "pending_scores" not in st
-        or st["pending_scores"].shape[0] != seq_len
-    )
-    if needs_open:
-        eng.begin_score_round(seq_id, seq_len, k_cached_trim.device)
-
-    # Compute max_pos / window_thr from the live mask (cheap; <O(seq_len)).
-    positions = torch.arange(seq_len, dtype=torch.int32, device=valid.device)
-    live_pos = positions[valid]
-    if live_pos.numel() == 0:
-        return
-    max_pos = int(live_pos.max().item())
-    window_thr = max_pos - eng.cfg.window_size + 1
-
-    eng.accumulate_layer_score(seq_id, layer_il, k_cached_trim, max_pos, window_thr)
-    st = eng._seq_state[seq_id]
-    if "pending_layers" in st:
-        st["pending_layers"].add(layer_il)
-    # Finalisation is deferred to the next pass start (when we see a layer
-    # that's already in pending_layers). This naturally handles boundary
-    # layers that bypass the TQ backend: we accumulate however many TQ
-    # layers fired this pass and finalise on the first layer of the next.
-
-
-def _build_triatt_valid_mask(cam, num_decodes: int) -> torch.Tensor | None:
-    """Build a per-(batch, position) validity mask for TriAttention V3.
-
-    Returns a uint8 tensor of shape [B, max_seq_len] where 1=live, 0=evicted,
-    or None if V3 is not engaged.
-
-    Phase A scope: B == 1 (single-sequence research/eval workloads — PPL,
-    NIAH). Multi-batch V3 needs request-id plumbing through CommonAttention
-    Metadata; deferred to Phase D.
-    """
-    eng = _get_triatt_engine()
-    if eng is None or not eng.calibrated:
-        return None
-    seq_lens = cam.seq_lens
-    B = int(seq_lens.shape[0])
-    if B != 1:
-        # V3 multi-batch path not yet implemented; safe fallback (all live).
-        return None
-    seq_len = int(cam.max_seq_len)
-    device = seq_lens.device
-    # Engine state is keyed by sequence id; for B=1 we use seq_id=0 by
-    # convention. The engine maintains the persistent valid-mask buffer.
-    valid_bool = eng.get_valid_mask(seq_id=0, seq_len=seq_len, device=device)
-    return valid_bool.to(torch.uint8).contiguous().unsqueeze(0)
 
 
 def _tq_sparse_v_enabled(max_seq_len: int) -> bool:
@@ -410,7 +325,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             cam, decode_threshold=self.reorder_batch_threshold
         )
 
-        triatt_valid_mask = _build_triatt_valid_mask(cam, num_decodes)
+        triatt_valid_mask = _build_triatt_valid_mask(cam)
 
         return TurboQuantMetadata(
             seq_lens=cam.seq_lens,
@@ -990,19 +905,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
         # TriAttention V3: push the dequant'd cached K to the engine for
-        # per-layer score accumulation. The engine starts a new round on the
-        # first attention layer it sees per pass, accumulates contributions
-        # across layers, and auto-finalises (running V3 selection + updating
-        # the valid mask) once all attention layers have reported.
-        triatt_eng = _get_triatt_engine()
-        if (
-            triatt_eng is not None
-            and triatt_eng.calibrated
-            and cached_len > 0
-        ):
-            _v3_accumulate_prefill_k(
-                triatt_eng, layer.layer_name, k_cached_trim, cached_len
-            )
+        # per-layer score accumulation. No-op when V3 is disabled.
+        _v3_accumulate_prefill_k(layer.layer_name, k_cached_trim, cached_len)
 
         # TQ+: inverse WHT on dequanted cached values, then slice if padded
         if self.tq_config.rotate_values:
