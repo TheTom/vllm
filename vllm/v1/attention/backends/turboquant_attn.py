@@ -985,7 +985,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Grouped kernel covers MSE K + 4-bit V (with NC and/or centroid V).
         # Falls back to single-Q kernel for FP8 K or 2-bit/3-bit V.
-        # Sparse V composes with grouped (orthogonal optimization).
+        # Sparse V is single-Q-only at default settings: the grouped kernel
+        # already amortises K/V loads across M_GRP queries, so the extra
+        # per-tile branch overhead exceeds the marginal V-load savings on
+        # MoE-30B-A3B (-6.7% at 32K when composed). Sparse V remains the
+        # win on the single-Q fallback path. Override via env var if needed.
         Hq = query.shape[1]
         Hk = kv_cache.shape[2]
         kv_group = Hq // Hk
@@ -995,6 +999,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             and kv_group > 1
             and not self.tq_config.key_fp8
             and self.tq_config.effective_value_quant_bits == 4
+        )
+        # Default: when grouped wins, sparse V is off. User can compose
+        # explicitly with VLLM_TQ_SPARSE_V_COMPOSE_GROUPED=1.
+        sparse_v_grouped = (
+            sparse_v_active
+            and _os.environ.get("VLLM_TQ_SPARSE_V_COMPOSE_GROUPED", "0") == "1"
         )
 
         if use_grouped:
@@ -1015,7 +1025,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_num_kv_splits=self.max_num_kv_splits,
                 rotate_values=self.tq_config.rotate_values,
                 original_head_dim=self.head_size,
-                sparse_v=sparse_v_active,
+                sparse_v=sparse_v_grouped,
                 sparse_v_threshold=_TQ_SPARSE_V_THRESHOLD,
             )
 
