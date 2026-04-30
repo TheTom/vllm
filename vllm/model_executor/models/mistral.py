@@ -17,6 +17,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.v1.attention.triattention.hooks import capture_q_pre_rope
 from vllm.model_executor.models.llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -132,6 +133,9 @@ class MistralAttention(LlamaAttention):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # TriAttention V3 Q capture (pre-RoPE). _triatt_layer_idx is set in
+        # the parent LlamaAttention.__init__.
+        capture_q_pre_rope(self._triatt_layer_idx, q)
         q, k = self.rotary_emb(positions, q, k)
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)

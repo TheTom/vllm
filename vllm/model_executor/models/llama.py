@@ -48,6 +48,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.v1.attention.triattention.hooks import capture_q_pre_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -138,6 +139,7 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self._triatt_layer_idx = layer_idx
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -227,6 +229,8 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # TriAttention V3 Q capture (pre-RoPE).
+        capture_q_pre_rope(self._triatt_layer_idx, q)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

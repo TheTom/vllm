@@ -1137,6 +1137,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 original_head_dim=self.head_size,
                 sparse_v=sparse_v_grouped,
                 sparse_v_threshold=_TQ_SPARSE_V_THRESHOLD,
+                valid_mask=attn_metadata.triatt_valid_mask,
             )
 
         return triton_turboquant_decode_attention(

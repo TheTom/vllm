@@ -41,7 +41,12 @@ MODE_KV: dict[str, str] = {
     "v3": "turboquant_k8v4",
     "tq": "turboquant_4bit_nc_cv_rv",
     "stack": "turboquant_k8v4",
+    # Custom modes for the TQ-variant ablation: --kv overrides the dtype.
+    "tq_variant": "OVERRIDE",
+    "stack_variant": "OVERRIDE",
 }
+
+V3_MODES = {"v3", "stack", "stack_variant"}
 
 
 def load_chunks(path: str, ctx: int, tokenizer):
@@ -133,7 +138,12 @@ def main():
         "--mode",
         choices=list(MODE_KV.keys()),
         required=True,
-        help="baseline / v3 / tq / stack",
+        help="baseline / v3 / tq / stack / tq_variant / stack_variant",
+    )
+    ap.add_argument(
+        "--kv",
+        default=None,
+        help="kv_cache_dtype override (required for *_variant modes)",
     )
     ap.add_argument("--ctx", type=int, default=32768)
     ap.add_argument("--chunks", type=int, default=3)
@@ -147,8 +157,12 @@ def main():
     args = ap.parse_args()
 
     kv = MODE_KV[args.mode]
+    if kv == "OVERRIDE":
+        if not args.kv:
+            ap.error("--kv is required when --mode is *_variant")
+        kv = args.kv
     triatt_cfg: TriAttentionV3Config | None = None
-    if args.mode in ("v3", "stack"):
+    if args.mode in V3_MODES:
         triatt_cfg = TriAttentionV3Config(
             budget=args.budget,
             prefix_protect=args.prefix,

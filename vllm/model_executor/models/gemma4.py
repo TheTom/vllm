@@ -52,6 +52,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.v1.attention.triattention.hooks import capture_q_pre_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -430,6 +431,7 @@ class Gemma4Attention(nn.Module):
 
         # Determine layer type and sliding window
         layer_idx = extract_layer_index(prefix)
+        self._triatt_layer_idx = layer_idx
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
@@ -522,6 +524,8 @@ class Gemma4Attention(nn.Module):
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
             k = self.k_norm(k)
             k = k.flatten(-2, -1)
+            # TriAttention V3 Q capture (pre-RoPE).
+            capture_q_pre_rope(self._triatt_layer_idx, q)
             q, k = self.rotary_emb(positions, q, k)
 
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
@@ -529,6 +533,7 @@ class Gemma4Attention(nn.Module):
             v = v.flatten(-2, -1)
         else:
             # Shared: only apply RoPE to Q
+            capture_q_pre_rope(self._triatt_layer_idx, q)
             q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)

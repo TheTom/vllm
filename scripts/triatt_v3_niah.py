@@ -53,10 +53,30 @@ MODE_KV: dict[str, str] = {
 }
 
 
-def build_prompt(haystack: str, char_pos: int) -> str:
-    before = haystack[:char_pos]
-    after = haystack[char_pos:]
-    return f"{before}\n{NEEDLE}\n{after}\n\n{QUESTION}\n"
+def build_prompt(
+    haystack: str, char_pos: int, tokenizer, target_tokens: int
+) -> list[int]:
+    """Build a token-id list of length <= target_tokens with the needle
+    inserted at `char_pos` chars into the haystack and the question
+    appended at the end.
+    """
+    before_text = haystack[:char_pos]
+    after_text = haystack[char_pos:]
+    text = f"{before_text}\n{NEEDLE}\n{after_text}\n\n{QUESTION}\n"
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= target_tokens:
+        return ids
+    # Truncate to fit. Keep the needle (~early in context for "start" pos,
+    # need to also keep question at the very end). Trim the haystack tail.
+    # NOTE: for "end" position the needle is near the end of the haystack;
+    # truncating from the tail removes the question. So we truncate from the
+    # MIDDLE: keep the first half (which contains the start/middle needle)
+    # and the last few hundred tokens (which contain the question and the
+    # end-position needle if any).
+    keep_tail = 256
+    head = ids[: target_tokens - keep_tail]
+    tail = ids[-keep_tail:]
+    return head + tail
 
 
 def classify(out_text: str) -> str:
@@ -86,7 +106,6 @@ def main():
     args = ap.parse_args()
 
     haystack = open(args.haystack).read()
-    haystack = haystack[: max(args.ctx * 4 + 50_000, 1)]
 
     kv = MODE_KV[args.mode]
 
@@ -112,7 +131,9 @@ def main():
         model=args.model,
         dtype="bfloat16",
         kv_cache_dtype=kv,
-        max_model_len=args.ctx + args.gen + 16,
+        # Headroom for the inserted needle + question (~30-50 tokens) on top
+        # of the haystack-derived prompt (~ctx tokens) plus generation budget.
+        max_model_len=args.ctx + args.gen + 512,
         gpu_memory_utilization=args.gpu_mem,
         disable_log_stats=True,
         enable_prefix_caching=False,
@@ -121,15 +142,18 @@ def main():
     print(f"# loaded in {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
 
     sp = SamplingParams(max_tokens=args.gen, temperature=0.0)
+    tokenizer = llm.get_tokenizer()
 
     positions = POSITIONS_32K if args.ctx <= 32 * 1024 else POSITIONS_64K
     pos_names = ["start", "middle", "end"]
 
     print("mode,kv,ctx,position,char_pos,result")
     for name, char_pos in zip(pos_names, positions):
-        prompt = build_prompt(haystack, char_pos)
+        prompt_ids = build_prompt(haystack, char_pos, tokenizer, args.ctx)
         out = llm.generate(
-            [prompt], sampling_params=sp, use_tqdm=False
+            {"prompt_token_ids": prompt_ids},
+            sampling_params=sp,
+            use_tqdm=False,
         )[0]
         text = out.outputs[0].text
         verdict = classify(text)

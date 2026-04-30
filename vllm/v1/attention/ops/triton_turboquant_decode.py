@@ -758,6 +758,8 @@ def _tq_decode_stage1_grouped(
     KV_cache_ptr,           # [num_blocks, block_size, Hk, padded_slot] uint8
     Block_table_ptr,        # [B, max_blocks] int32
     Seq_lens_ptr,           # [B] int32
+    Valid_mask_ptr,         # [B, max_seq_len] uint8 or null (TriAttention V3)
+    stride_vm_b,
     Centroids_ptr,          # [n_centroids] float32
     Mid_o_ptr,              # [B, Hq, NUM_KV_SPLITS, D+1] float32
     stride_qb,
@@ -787,6 +789,7 @@ def _tq_decode_stage1_grouped(
     VALUE_CENTROID: tl.constexpr = 0,
     SPARSE_V: tl.constexpr = 0,
     SPARSE_V_THRESHOLD: tl.constexpr = 0.1,
+    VALID_MASK: tl.constexpr = 0,
 ):
     bid = tl.program_id(0)         # batch
     grp_id = tl.program_id(1)      # which kv-head-group (== kv_head when M_GRP=KV_GROUP_SIZE)
@@ -886,6 +889,13 @@ def _tq_decode_stage1_grouped(
         # tl.dot expects f16/bf16 inputs for MFMA; we keep f32 and accept FMA.
         scores = tl.dot(q_rot, tl.trans(c_vals)) * vec_norms[None, :] * ATTN_SCALE
         scores = tl.where(kv_mask[None, :], scores, -float("inf"))
+
+        # TriAttention V3: per-position validity mask (one entry per kv slot,
+        # broadcast across the M_GRP query rows). Same semantic as in single-Q.
+        if VALID_MASK:
+            vm_addr = bid * stride_vm_b + kv_offs
+            vm = tl.load(Valid_mask_ptr + vm_addr, mask=kv_mask, other=0).to(tl.int32)
+            scores = tl.where(vm[None, :] > 0, scores, -float("inf"))
 
         # ---------------- Online softmax (per row) ----------------
         score_max = tl.max(scores, axis=1)               # [M_GRP]
@@ -1007,6 +1017,7 @@ def triton_turboquant_decode_attention_grouped(
     m_grp: int | None = None,
     sparse_v: bool = False,
     sparse_v_threshold: float = 0.1,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batched-Q variant of triton_turboquant_decode_attention.
 
@@ -1052,6 +1063,15 @@ def triton_turboquant_decode_attention_grouped(
     NUM_KV_SPLITS = max_num_kv_splits
     mid_o = torch.empty(B, Hq, NUM_KV_SPLITS, D + 1, dtype=torch.float32, device=device)
 
+    if valid_mask is not None:
+        vm_tensor = valid_mask
+        vm_stride_b = valid_mask.stride(0)
+        valid_mask_flag = 1
+    else:
+        vm_tensor = q_rot
+        vm_stride_b = 0
+        valid_mask_flag = 0
+
     # Grid: (B, num_kv_heads, NUM_KV_SPLITS) — each program handles M_GRP q heads
     grid = (B, Hk, NUM_KV_SPLITS)
     BLOCK_KV = 16  # MFMA-aligned (M_GRP=8 × BLOCK_KV=16 × HEAD_DIM=128 — 2 of 3 dims are 16+)
@@ -1060,6 +1080,8 @@ def triton_turboquant_decode_attention_grouped(
         kv_cache,
         block_table,
         seq_lens,
+        vm_tensor,
+        vm_stride_b,
         centroids,
         mid_o,
         q_rot.stride(0),
@@ -1089,6 +1111,7 @@ def triton_turboquant_decode_attention_grouped(
         VALUE_CENTROID=1 if value_centroid else 0,
         SPARSE_V=1 if sparse_v else 0,
         SPARSE_V_THRESHOLD=sparse_v_threshold,
+        VALID_MASK=valid_mask_flag,
         num_warps=4,
         num_stages=2,
     )
