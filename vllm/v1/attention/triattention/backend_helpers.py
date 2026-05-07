@@ -28,13 +28,221 @@ request-id plumbing through `CommonAttentionMetadata` and is deferred.
 """
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.triattention.hooks import get_engine
 
+logger = init_logger(__name__)
+
 
 _SINGLE_SEQ_ID = 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 + Tier 3: longctx-svc evict-to-vector / rehydrate hooks
+# Design: TriAttention V3 — 3-Tier Eviction Rescue Architecture (obsidian).
+# ---------------------------------------------------------------------------
+
+
+# Per-session prompt token IDs (set by the prefill hook so the eviction
+# callback can decode evicted positions back to text). Replaced with each
+# new prefill of the same session id.
+_PROMPT_TOKEN_IDS: dict[int, list[int]] = {}
+# Per-session tokenizer reference (lazy-bound on first prefill capture).
+_TOKENIZER = None
+# Per-session id ↔ longctx session id mapping. Phase A is single-batch
+# (all V3 work happens at seq_id=0), so we store a single string here.
+_LONGCTX_SESSION_ID: str = "v3-single-session"
+# Tier 2 endpoint config. Read once from env at first use.
+_LONGCTX_BASE_URL: Optional[str] = None
+_LONGCTX_HTTP = None  # requests.Session, lazy-built
+
+
+def set_prompt_token_ids(seq_id: int, token_ids: list[int]) -> None:
+    """Stash the prompt's token IDs for a session so the eviction
+    callback can decode evicted positions back to text. Called from
+    the prefill hook with the freshly-tokenized prompt.
+    """
+    _PROMPT_TOKEN_IDS[int(seq_id)] = list(token_ids)
+
+
+def set_tokenizer(tok) -> None:
+    """Bind the model's tokenizer once at engine init. Used by the
+    eviction callback to decode evicted positions back to text."""
+    global _TOKENIZER
+    _TOKENIZER = tok
+
+
+def set_longctx_session_id(session_id: str) -> None:
+    """Set the longctx-svc session id used by /evict/write + /retrieve.
+    Default is `v3-single-session`; per-request batches will need
+    request-id plumbing in a future phase.
+    """
+    global _LONGCTX_SESSION_ID
+    _LONGCTX_SESSION_ID = str(session_id)
+
+
+def _get_longctx_base_url() -> Optional[str]:
+    global _LONGCTX_BASE_URL
+    if _LONGCTX_BASE_URL is None:
+        _LONGCTX_BASE_URL = os.environ.get("LONGCTX_ENDPOINT")
+    return _LONGCTX_BASE_URL
+
+
+def _get_http_session():
+    global _LONGCTX_HTTP
+    if _LONGCTX_HTTP is None:
+        import requests
+        _LONGCTX_HTTP = requests.Session()
+    return _LONGCTX_HTTP
+
+
+def _evict_to_longctx_callback(
+    seq_id: int, evict_pos: torch.Tensor, n_evicted: int,
+) -> None:
+    """V3 engine's eviction callback. Decodes evicted positions back to
+    text spans (via the bound tokenizer + the stashed prompt token IDs)
+    and POSTs to longctx-svc /evict/write.
+
+    Span grouping: contiguous runs of evicted positions are merged into
+    single spans (avoids one-chunk-per-token). Spans are decoded with a
+    ±32 token bleed for context (so the chunk doesn't start mid-sentence
+    and the embedder sees coherent text).
+
+    No-op when LONGCTX_ENDPOINT is unset, when the tokenizer hasn't been
+    bound yet, or when no token IDs are stashed for this session.
+    """
+    base = _get_longctx_base_url()
+    if not base:
+        return
+    if _TOKENIZER is None:
+        logger.warning(
+            "TriAttention V3 eviction callback: tokenizer not bound; "
+            "cannot decode evicted positions. Call set_tokenizer() at "
+            "engine init."
+        )
+        return
+    token_ids = _PROMPT_TOKEN_IDS.get(int(seq_id))
+    if not token_ids:
+        # Common case: short prefill, no token IDs stashed yet (e.g.
+        # tool-call probes). Skip silently.
+        return
+
+    # Sort + group contiguous positions
+    pos_cpu = sorted(p for p in evict_pos.detach().cpu().tolist()
+                     if 0 <= p < len(token_ids))
+    if not pos_cpu:
+        return
+    spans: list[tuple[int, int]] = []
+    cur_start = pos_cpu[0]
+    cur_end = pos_cpu[0]
+    for p in pos_cpu[1:]:
+        if p == cur_end + 1:
+            cur_end = p
+        else:
+            spans.append((cur_start, cur_end))
+            cur_start = p
+            cur_end = p
+    spans.append((cur_start, cur_end))
+
+    # Expand each span ±32 tokens for context bleed; clamp to bounds.
+    BLEED = 32
+    chunks_payload: list[dict] = []
+    for (s, e) in spans:
+        ws = max(0, s - BLEED)
+        we = min(len(token_ids), e + 1 + BLEED)
+        try:
+            text = _TOKENIZER.decode(
+                token_ids[ws:we], skip_special_tokens=True,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if not text.strip():
+            continue
+        chunks_payload.append({
+            "text": text,
+            "token_range": (int(ws), int(we)),
+            "layer": -1,  # multi-layer eviction; we don't track layer here
+            "score": 0.0,  # score not surfaced through callback yet
+        })
+
+    if not chunks_payload:
+        return
+
+    url = base.rstrip("/") + "/evict/write"
+    body = {
+        "session_id": _LONGCTX_SESSION_ID,
+        "chunks": chunks_payload,
+    }
+    try:
+        # Synchronous POST is fine because finalize_evict_round is itself
+        # off the hot decode path (only fires when cache pressure crosses
+        # budget). Latency dominated by MiniLM embed on the longctx side
+        # (~tens of ms for a few chunks). Async / fire-and-forget is a
+        # follow-up optimization.
+        sess = _get_http_session()
+        sess.post(url, json=body, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "TriAttention V3 evict-to-vector POST to %s failed: %s",
+            url, exc,
+        )
+
+
+def install_eviction_to_longctx() -> bool:
+    """Register the Tier 2 callback on the global V3 engine. Idempotent.
+    Returns True when wired, False when prerequisites are missing
+    (engine not yet initialized, or LONGCTX_ENDPOINT unset).
+    """
+    eng = get_engine()
+    if eng is None:
+        return False
+    if not _get_longctx_base_url():
+        return False
+    eng.set_eviction_callback(_evict_to_longctx_callback)
+    logger.info(
+        "TriAttention V3 evict-to-vector enabled — POSTing evicted spans "
+        "to %s/evict/write (session_id=%s)",
+        _LONGCTX_BASE_URL, _LONGCTX_SESSION_ID,
+    )
+    return True
+
+
+def retrieve_evicted_for_query(
+    query: str, top_k: int = 8, score_floor: float = 0.0,
+) -> list[dict]:
+    """Tier 3: retrieve evicted spans relevant to the user's current
+    query. Called by a prefill hook before each new turn. Returns a
+    list of {text, token_range, layer, score} dicts; empty list when
+    longctx is unconfigured or has no evictions for this session.
+    """
+    base = _get_longctx_base_url()
+    if not base:
+        return []
+    url = base.rstrip("/") + "/evict/retrieve"
+    body = {
+        "session_id": _LONGCTX_SESSION_ID,
+        "query": query,
+        "top_k": int(top_k),
+        "score_floor": float(score_floor),
+    }
+    try:
+        sess = _get_http_session()
+        r = sess.post(url, json=body, timeout=10.0)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return list(data.get("chunks") or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "TriAttention V3 evict-retrieve from %s failed: %s", url, exc,
+        )
+        return []
 
 
 def accumulate_prefill_k(

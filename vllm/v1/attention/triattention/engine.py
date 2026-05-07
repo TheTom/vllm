@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 
@@ -171,6 +171,16 @@ class TriAttentionV3Engine:
 
         # Total eviction rounds across all sequences (for telemetry).
         self.total_evict_rounds: int = 0
+
+        # Tier 2 hook: optional callback fired AFTER each successful
+        # eviction round. Backend / longctx integration registers this to
+        # capture evicted-span text for cross-turn rehydration.
+        # Signature: (seq_id, evicted_positions, n_evicted) -> None
+        # Engine itself stays I/O-free; the callback owns tokenizer access
+        # + HTTP. None disables Tier 2 (default).
+        self._eviction_callback: Optional[
+            "Callable[[int, torch.Tensor, int], None]"
+        ] = None
 
     # ------------------------------------------------------------------
     # Calibration
@@ -531,7 +541,35 @@ class TriAttentionV3Engine:
                 self.total_evict_rounds, seq_len, used, used - n_evicted,
                 n_evicted, max_pos, window_thr, seq_len, prefix_lo,
             )
+        # Tier 2: fire the eviction callback so the backend can capture
+        # evicted-span text into longctx-svc. Must NOT block the eviction
+        # loop — callbacks are expected to be fast (HTTP fire-and-forget
+        # or queued for an async worker). Exceptions in the callback are
+        # logged but suppressed so a misbehaving rescue path can't crash
+        # decoding.
+        if self._eviction_callback is not None and n_evicted > 0:
+            try:
+                self._eviction_callback(seq_id, evict_pos, n_evicted)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "TriAttention V3 eviction callback raised %s: %s — "
+                    "suppressed to keep eviction running.",
+                    type(exc).__name__, exc,
+                )
         return n_evicted
+
+    def set_eviction_callback(
+        self,
+        callback: "Optional[Callable[[int, torch.Tensor, int], None]]",
+    ) -> None:
+        """Register the Tier 2 hook. Pass None to disable.
+
+        Callback receives (seq_id, evicted_positions_tensor, n_evicted)
+        AFTER the valid mask has been updated. The positions tensor is
+        already on-device; callback is responsible for moving to CPU /
+        decoding to text via the model tokenizer it has access to.
+        """
+        self._eviction_callback = callback
 
     # ------------------------------------------------------------------
     # One-shot eviction (used by tests + manual triggers)
