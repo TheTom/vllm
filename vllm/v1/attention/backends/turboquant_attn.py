@@ -920,7 +920,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # cache pressure exceeds budget AND there are pending scores —
         # safely batches up score contributions across multiple layer
         # calls before the policy actually runs.
-        _v3_maybe_finalize_evict(layer.layer_name)
+        #
+        # The `effective_seq_len = cached_len + seq_len - cached_len`
+        # passes the POST-append size to should_evict. accumulate_prefill_k
+        # uses `cached_len` (pre-append) which underestimates the true
+        # cache size by `q_len` per chunk — meaning the budget gate
+        # never tripped in practice on NIAH-32K with 8192-token chunks
+        # (max cached_len = 24576 < default budget = 29491 even though
+        # the cache is full at 32768 by end of prefill).
+        _v3_maybe_finalize_evict(
+            layer.layer_name,
+            effective_seq_len=int(seq_len),
+        )
 
         # TQ+: inverse WHT on dequanted cached values, then slice if padded
         if self.tq_config.rotate_values:

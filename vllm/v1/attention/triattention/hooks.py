@@ -60,15 +60,48 @@ def is_enabled() -> bool:
     return _engine is not None or os.environ.get(ENV_ENABLED, "0") == "1"
 
 
+def _resolve_dims_from_env() -> Optional[dict]:
+    """Fallback: read architecture dims from VLLM_TRIATT_* env vars.
+
+    The primary path (`get_current_vllm_config()`) raises AssertionError
+    when called from inside the worker's torch-op dispatch context (the
+    config is set per-thread and the dispatcher fires on a fresh thread).
+    This fallback lets the user pin dims directly, bypassing the assert.
+    Required vars: N_LAYERS / N_HEADS / N_KV_HEADS / HEAD_DIM. Optional:
+    ROPE_THETA (default 10000), N_ROT (default = HEAD_DIM).
+    """
+    n_layers = os.environ.get("VLLM_TRIATT_N_LAYERS")
+    n_heads = os.environ.get("VLLM_TRIATT_N_HEADS")
+    if not n_layers or not n_heads:
+        return None
+    head_dim = int(os.environ.get("VLLM_TRIATT_HEAD_DIM", "128"))
+    return {
+        "n_layers": int(n_layers),
+        "n_heads": int(n_heads),
+        "n_kv_heads": int(
+            os.environ.get("VLLM_TRIATT_N_KV_HEADS", n_heads)
+        ),
+        "head_dim": head_dim,
+        "rope_theta": float(os.environ.get("VLLM_TRIATT_ROPE_THETA", "10000.0")),
+        "n_rot": int(os.environ.get("VLLM_TRIATT_N_ROT", str(head_dim))),
+    }
+
+
 def _resolve_dims_from_vllm_config() -> Optional[dict]:
     """Pull architecture dims out of the active VllmConfig.
 
-    Called from inside the worker on first Q capture. Returns None if
-    vllm_config isn't available (engine init bails in that case).
+    Called from inside the worker on first Q capture. Falls back to
+    `_resolve_dims_from_env` when `get_current_vllm_config()` raises
+    AssertionError (the config is per-thread and the worker's torch-op
+    dispatch fires on a thread without it set). Returns None when both
+    paths fail; engine init then logs a warning and stays disabled.
     """
-    vllm_cfg = get_current_vllm_config()
+    try:
+        vllm_cfg = get_current_vllm_config()
+    except AssertionError:
+        return _resolve_dims_from_env()
     if vllm_cfg is None:
-        return None
+        return _resolve_dims_from_env()
     hf = vllm_cfg.model_config.hf_text_config
     n_layers = hf.num_hidden_layers
     n_heads = hf.num_attention_heads
@@ -95,16 +128,25 @@ def _lazy_init(device: torch.device) -> None:
     VllmConfig.
     """
     global _engine, _lazy_init_attempted
-    _lazy_init_attempted = True
     if os.environ.get(ENV_ENABLED, "0") != "1":
+        _lazy_init_attempted = True
         return
     dims = _resolve_dims_from_vllm_config()
     if dims is None:
+        # Don't latch on a transient config-not-available error. The first
+        # Q-capture often fires from a thread where the per-thread VllmConfig
+        # isn't set yet but a later Q-capture has it. Latching here meant
+        # one early miss permanently disabled V3 for the worker. Now we
+        # only latch after we've SUCCESSFULLY built the engine OR after
+        # we've explicitly decided V3 is off (the early-return above).
         logger.warning(
-            "TriAttention V3 enabled but VllmConfig is not available at first "
-            "Q-capture; engine will not initialise."
+            "TriAttention V3 enabled but VllmConfig is not available at "
+            "this Q-capture; will retry on the next call. Set "
+            "VLLM_TRIATT_N_LAYERS / N_HEADS / HEAD_DIM env vars as a "
+            "fallback if this keeps firing."
         )
         return
+    _lazy_init_attempted = True
     cfg = TriAttentionV3Config.from_env()
     _engine = TriAttentionV3Engine(
         cfg=cfg,
@@ -133,6 +175,10 @@ def _capture_q_impl(q: torch.Tensor, layer_idx: int) -> None:
     process on first call, reading config from VLLM_TRIATT_* env vars.
     """
     if _engine is None:
+        # Retry init each call until it succeeds or VLLM_TRIATT_ENABLED=0
+        # is observed (which sets the latch). The previous "latch on first
+        # attempt" behaviour permanently disabled V3 if the first call
+        # raced ahead of VllmConfig being available in the worker thread.
         if _lazy_init_attempted:
             return
         _lazy_init(q.device)

@@ -300,19 +300,32 @@ def accumulate_prefill_k(
         st["pending_layers"].add(layer_il)
 
 
-def maybe_finalize_evict(layer_name: str | None = None) -> int:
+def maybe_finalize_evict(
+    layer_name: str | None = None,
+    effective_seq_len: int | None = None,
+) -> int:
     """Explicit end-of-pass trigger for V3's policy.
 
     Returns the number of positions evicted (0 when V3 is off, not
     calibrated, no pending scores, or cache size below the budget gate).
 
+    `effective_seq_len`, when supplied, OVERRIDES the engine's stashed
+    `pending_seq_len` for the budget check. Required for chunked prefill:
+    `accumulate_prefill_k` is called with `cached_len` (tokens already
+    in cache BEFORE the current chunk's K is appended), so the engine's
+    pending_seq_len underestimates the true post-append cache size by
+    `q_len`. Pass `cached_len + q_len` to make the budget gate fire on
+    the actual cache size after this chunk lands. Without the override,
+    NIAH-32K with 8192-token chunks tops out at pending_seq_len=24576
+    on a 32K prompt — never crossing the default budget=29491 even
+    though the cache is full at 32768 by the end of prefill.
+
     Designed to be called once per prefill / continuation chunk after
     the last attention layer's K has been pushed via
     `accumulate_prefill_k`. The duplicate-layer detection inside
     `accumulate_prefill_k` is fine for chunked / multi-pass prefill but
-    misses the single-pass case (typical for NIAH-style benches: one
-    forward over the whole prompt, then small decode chunks via a
-    different kernel). Calling this after each pass is closes that gap.
+    misses the single-pass case (typical for NIAH-style benches at small
+    chunk counts). Calling this after each chunk closes that gap.
 
     Idempotent: safe to call from multiple sites; it only finalizes when
     there are pending scores AND `should_evict` says budget is exceeded.
@@ -324,10 +337,17 @@ def maybe_finalize_evict(layer_name: str | None = None) -> int:
     st = eng._seq_state.get(seq_id)
     if st is None or "pending_scores" not in st:
         return 0
-    seq_len = int(st.get("pending_seq_len", 0))
-    if seq_len <= 0:
+    pending_len = int(st.get("pending_seq_len", 0))
+    if pending_len <= 0:
         return 0
-    if not eng.should_evict(seq_id, seq_len):
+    # Use the explicit post-append size when provided; otherwise fall
+    # back to the engine's stashed value.
+    check_len = (
+        int(effective_seq_len)
+        if effective_seq_len is not None and int(effective_seq_len) > 0
+        else pending_len
+    )
+    if not eng.should_evict(seq_id, check_len):
         # Cache below budget — accumulated scores stay open for the next
         # pass; no point firing the policy with nothing to evict.
         return 0

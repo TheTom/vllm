@@ -270,6 +270,15 @@ class RocmAttentionImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
         sinks: torch.Tensor | None = None,
+        # vLLM's `Attention` class (vllm/attention/layer.py) passes additional
+        # kwargs that downstream backends accept silently. Add them here so
+        # ROCm-on-AMD model construction doesn't fail with "unexpected
+        # keyword argument" errors when running V3-enabled models on
+        # configs that exercise these paths (the previous tester / repro
+        # subagent both reported tripping this on Qwen2.5-7B-Instruct).
+        layer_idx: int | None = None,
+        layer_name: str | None = None,
+        **_unused_backend_kwargs: object,
     ) -> None:
         self.attn_type = attn_type
         self.num_heads = num_heads
