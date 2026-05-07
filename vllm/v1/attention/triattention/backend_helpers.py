@@ -364,10 +364,21 @@ def maybe_finalize_evict(
     # Only fire when ALL expected attention layers have contributed to
     # the pending score buffer. Otherwise we'd run the policy on a
     # partial sum (layers 1..N missing) and the per-segment quota
-    # would behave erratically. `n_layers - boundary_skip` is the count
-    # of layers expected to fire `accumulate_layer_score`; the boundary-
-    # skip layers are the ones the engine refuses to score by config.
-    expected_layers = max(1, eng.n_layers - eng.cfg.boundary_skip)
+    # would behave erratically.
+    #
+    # Default expectation follows the engine's native boundary_skip
+    # setting. TurboQuant has an extra architecture-level wrinkle: it can
+    # intentionally keep first/last layers outside the TQ backend, so those
+    # layers never call `accumulate_prefill_k` even though the engine should
+    # finalize over the middle layers. `VLLM_TRIATT_EXPECTED_LAYERS` lets the
+    # worker declare the exact number of layers that will actually fire
+    # hooks (MI300X Qwen3-30B TQ K/V: 28 total, 24 TQ-hooked).
+    expected_layers = (
+        int(eng.cfg.expected_layers)
+        if eng.cfg.expected_layers is not None
+        else eng.n_layers - eng.cfg.boundary_skip
+    )
+    expected_layers = max(1, expected_layers)
     seen_layers = len(st.get("pending_layers", set()))
     if seen_layers < expected_layers:
         return 0

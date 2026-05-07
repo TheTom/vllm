@@ -73,6 +73,7 @@ def _make_engine(
     budget: int = 64,
     warmup_tokens: int = 64,
     boundary_skip: int = 0,
+    expected_layers: int | None = None,
     divide_length: int = 8,
 ) -> TriAttentionV3Engine:
     cfg = TriAttentionV3Config(
@@ -86,6 +87,7 @@ def _make_engine(
         query_tokens=16,
         query_min_window=32,
         boundary_skip=boundary_skip,
+        expected_layers=expected_layers,
         divide_length=divide_length,
     )
     return TriAttentionV3Engine(
@@ -267,6 +269,29 @@ class TestMaybeFinalizeEvict:
             effective_seq_len=seq_len
         ) == 0
         assert "pending_scores" in eng._seq_state[0]  # not finalized
+
+    def test_expected_layers_override_allows_backend_skipped_layers(self):
+        """TurboQuant can skip boundary layers outside the TQ backend.
+
+        The finalizer should wait for the number of layers that actually
+        fire V3 hooks, not always the model's total layer count.
+        """
+        eng = _calibrated_engine(budget=8, expected_layers=2)
+        hooks.set_engine(eng)
+        seq_len = 256
+        device = torch.device("cpu")
+        eng.begin_score_round(0, seq_len, device)
+        K = torch.randn(seq_len, eng.n_kv_heads, eng.head_dim)
+        max_pos = seq_len - 1
+        window_thr = max_pos - eng.cfg.window_size + 1
+        # Simulate TQ boundary protection: only middle layers fire hooks.
+        for il in (1, 2):
+            eng.accumulate_layer_score(0, il, K, max_pos, window_thr)
+            eng._seq_state[0]["pending_layers"].add(il)
+
+        n = backend_helpers.maybe_finalize_evict(effective_seq_len=seq_len)
+        assert n > 0
+        assert "pending_scores" not in eng._seq_state[0]
 
     def test_fires_when_all_conditions_met(self):
         eng = _calibrated_engine(budget=8)

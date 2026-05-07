@@ -44,6 +44,13 @@ class TriAttentionV3Config:
     # Boundary skip: kept for parity with llama.cpp impl; default 0 (proven
     # negative result on standard transformers, see docs §4.8).
     boundary_skip: int = 0
+    # Number of attention layers expected to contribute scores before an
+    # eviction round may finalize. None means derive from n_layers and
+    # boundary_skip. This is separate from boundary_skip because TurboQuant
+    # can intentionally leave first/last layers in fp16 outside the TQ backend,
+    # so those layers never call the V3 K hook even though the engine should
+    # still score/finalize the middle layers.
+    expected_layers: Optional[int] = None
 
     # Tier 1 query-aware eviction: blend trig score with current-query
     # attention score. λ=0 recovers paper-V3. The interesting regime is
@@ -80,6 +87,8 @@ class TriAttentionV3Config:
             cfg.query_tokens = int(v)
         if v := os.environ.get("VLLM_TRIATT_QUERY_MIN_WINDOW"):
             cfg.query_min_window = int(v)
+        if v := os.environ.get("VLLM_TRIATT_EXPECTED_LAYERS"):
+            cfg.expected_layers = int(v)
         return cfg
 
 

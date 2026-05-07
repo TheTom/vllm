@@ -35,6 +35,10 @@ Tuning knobs (all integer / boolean unless noted):
   VLLM_TRIATT_WARMUP    - Q samples before calibration fires (default 1024)
   VLLM_TRIATT_ADAPTIVE  - update calibration centers via EMA each round
                           ("0" / "1", default "0")
+  VLLM_TRIATT_EXPECTED_LAYERS
+                         - scoring layers expected before eviction finalizes
+                           (optional; e.g. 24 for 28-layer TQ with boundary
+                           layers stored outside the TQ backend)
 
 V3 only composes with KV-cache presets that store K in a dequant-able
 form. The validated path is `kv_cache_dtype="turboquant_k8v4"` (FP8 K +
@@ -72,6 +76,8 @@ def install_triattention(
     os.environ["VLLM_TRIATT_WINDOW"] = str(cfg.window_size)
     os.environ["VLLM_TRIATT_SEGMENTS"] = str(cfg.n_segments)
     os.environ["VLLM_TRIATT_WARMUP"] = str(cfg.warmup_tokens)
+    if cfg.expected_layers is not None:
+        os.environ["VLLM_TRIATT_EXPECTED_LAYERS"] = str(cfg.expected_layers)
     if cfg.adaptive_calibration:
         os.environ["VLLM_TRIATT_ADAPTIVE"] = "1"
     logger.info(

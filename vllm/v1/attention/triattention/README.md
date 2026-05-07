@@ -85,6 +85,7 @@ subprocess fork inherits the env vars.
 | `VLLM_TRIATT_SEGMENTS`   |     `8` | per-segment quota bucket count                   |
 | `VLLM_TRIATT_WARMUP`     |  `1024` | Q samples before calibration fires               |
 | `VLLM_TRIATT_ADAPTIVE`   |     `0` | EMA-update calibration centers each round        |
+| `VLLM_TRIATT_EXPECTED_LAYERS` | unset | score-hook layer count before eviction finalizes; use when a backend intentionally skips boundary layers |
 
 ## Supported KV cache presets
 
