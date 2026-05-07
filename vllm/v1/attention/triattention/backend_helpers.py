@@ -2,7 +2,7 @@
 
 These helpers live here (rather than inside `turboquant_attn.py`) so the
 backend file stays focused on TQ kernels and the V3 surface area lives
-in one module. Two entry points:
+in one module. Three entry points:
 
   - `accumulate_prefill_k(layer_name, k_cached, cached_len)`: pushes one
     attention layer's dequant'd cached K into the engine. Called from
@@ -10,6 +10,14 @@ in one module. Two entry points:
     Auto-detects pass boundaries by tracking which layer indices have
     already been seen this round, so the policy fires on the first layer
     of the next pass without needing an explicit signal from the runtime.
+
+  - `maybe_finalize_evict(layer_name)`: explicitly trigger eviction at
+    end-of-pass. The duplicate-layer detection in `accumulate_prefill_k`
+    only fires `finalize_evict_round` when a SECOND pass starts. For
+    single-pass prefill (NIAH-style: one big forward, then decode kernel
+    takes over) the second pass never comes, so eviction never fires.
+    Call this after the last attention layer of prefill to force the
+    policy to run on the accumulated scores.
 
   - `build_valid_mask(common_attn_metadata)`: returns the uint8 [B, S]
     validity tensor that the TurboQuant decode kernels consume via the
@@ -82,6 +90,50 @@ def accumulate_prefill_k(
     st = eng._seq_state[seq_id]
     if "pending_layers" in st:
         st["pending_layers"].add(layer_il)
+
+
+def maybe_finalize_evict(layer_name: str | None = None) -> int:
+    """Explicit end-of-pass trigger for V3's policy.
+
+    Returns the number of positions evicted (0 when V3 is off, not
+    calibrated, no pending scores, or cache size below the budget gate).
+
+    Designed to be called once per prefill / continuation chunk after
+    the last attention layer's K has been pushed via
+    `accumulate_prefill_k`. The duplicate-layer detection inside
+    `accumulate_prefill_k` is fine for chunked / multi-pass prefill but
+    misses the single-pass case (typical for NIAH-style benches: one
+    forward over the whole prompt, then small decode chunks via a
+    different kernel). Calling this after each pass is closes that gap.
+
+    Idempotent: safe to call from multiple sites; it only finalizes when
+    there are pending scores AND `should_evict` says budget is exceeded.
+    """
+    eng = get_engine()
+    if eng is None or not eng.calibrated:
+        return 0
+    seq_id = _SINGLE_SEQ_ID
+    st = eng._seq_state.get(seq_id)
+    if st is None or "pending_scores" not in st:
+        return 0
+    seq_len = int(st.get("pending_seq_len", 0))
+    if seq_len <= 0:
+        return 0
+    if not eng.should_evict(seq_id, seq_len):
+        # Cache below budget — accumulated scores stay open for the next
+        # pass; no point firing the policy with nothing to evict.
+        return 0
+    # Only fire when ALL expected attention layers have contributed to
+    # the pending score buffer. Otherwise we'd run the policy on a
+    # partial sum (layers 1..N missing) and the per-segment quota
+    # would behave erratically. `n_layers - boundary_skip` is the count
+    # of layers expected to fire `accumulate_layer_score`; the boundary-
+    # skip layers are the ones the engine refuses to score by config.
+    expected_layers = max(1, eng.n_layers - eng.cfg.boundary_skip)
+    seen_layers = len(st.get("pending_layers", set()))
+    if seen_layers < expected_layers:
+        return 0
+    return eng.finalize_evict_round(seq_id)
 
 
 def build_valid_mask(common_attn_metadata) -> torch.Tensor | None:

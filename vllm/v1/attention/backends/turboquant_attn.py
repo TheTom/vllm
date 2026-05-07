@@ -56,6 +56,7 @@ from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_stor
 from vllm.v1.attention.triattention.backend_helpers import (
     accumulate_prefill_k as _v3_accumulate_prefill_k,
     build_valid_mask as _build_triatt_valid_mask,
+    maybe_finalize_evict as _v3_maybe_finalize_evict,
 )
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -907,6 +908,19 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # TriAttention V3: push the dequant'd cached K to the engine for
         # per-layer score accumulation. No-op when V3 is disabled.
         _v3_accumulate_prefill_k(layer.layer_name, k_cached_trim, cached_len)
+        # End-of-pass eviction trigger. The duplicate-layer detection
+        # inside accumulate_prefill_k only fires the V3 policy when a
+        # second pass starts (e.g. chunked prefill or decode cycling
+        # back to layer 0). For single-pass prefill (one big forward
+        # over the entire prompt — typical for NIAH-style benches at
+        # context lengths under the chunk threshold), the second pass
+        # never comes through this kernel, so the policy never fires
+        # and accumulated scores leak forward as a no-op. Calling
+        # maybe_finalize_evict here is idempotent and only acts when
+        # cache pressure exceeds budget AND there are pending scores —
+        # safely batches up score contributions across multiple layer
+        # calls before the policy actually runs.
+        _v3_maybe_finalize_evict(layer.layer_name)
 
         # TQ+: inverse WHT on dequanted cached values, then slice if padded
         if self.tq_config.rotate_values:

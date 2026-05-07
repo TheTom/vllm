@@ -45,6 +45,18 @@ class TriAttentionV3Config:
     # negative result on standard transformers, see docs §4.8).
     boundary_skip: int = 0
 
+    # Tier 1 query-aware eviction: blend trig score with current-query
+    # attention score. λ=0 recovers paper-V3. The interesting regime is
+    # roughly λ ∈ [0.1, 5.0] — empirical sweep finds the right value.
+    # Design: TriAttention V3 — 3-Tier Eviction Rescue Architecture.
+    lambda_query_attn: float = 0.0
+    # Last N tokens of each prefill treated as "the user's question" —
+    # captured into q_query_* buffers for the Tier 1 score blend.
+    query_tokens: int = 32
+    # Min prefill length before query capture fires. Decode steps (single
+    # token) and trivial prefills (e.g. tool-call probes) skip this.
+    query_min_window: int = 64
+
     @classmethod
     def from_env(cls) -> "TriAttentionV3Config":
         cfg = cls()
@@ -62,6 +74,12 @@ class TriAttentionV3Config:
             cfg.warmup_tokens = int(v)
         if v := os.environ.get("VLLM_TRIATT_ADAPTIVE"):
             cfg.adaptive_calibration = bool(int(v))
+        if v := os.environ.get("VLLM_TRIATT_LAMBDA"):
+            cfg.lambda_query_attn = float(v)
+        if v := os.environ.get("VLLM_TRIATT_QUERY_TOKENS"):
+            cfg.query_tokens = int(v)
+        if v := os.environ.get("VLLM_TRIATT_QUERY_MIN_WINDOW"):
+            cfg.query_min_window = int(v)
         return cfg
 
 
@@ -122,6 +140,24 @@ class TriAttentionV3Engine:
         self.center_imag: Optional[torch.Tensor] = None
         self.center_abs: Optional[torch.Tensor] = None
 
+        # Tier 1 query-aware eviction: per-(layer, kv_head) Q buffers
+        # representing the user's most-recent question. These are the
+        # "current query centers" used as a second signal alongside the
+        # paper's calibration centers — see TriAttention V3 — 3-Tier
+        # Eviction Rescue Architecture (obsidian) for the design. Trig
+        # score predicts E[attention(Q, K_P)] over future queries
+        # (population prior); these centers are attention(Q_observed,
+        # K_P) for the actual query just submitted (likelihood). Blended
+        # via cfg.lambda_query_attn at scoring time.
+        #
+        # Captured on each prefill where shape[0] >= cfg.query_min_window
+        # by averaging the LAST cfg.query_tokens token positions' Q. Used
+        # in accumulate_layer_score when cfg.lambda_query_attn > 0.
+        self.q_query_real: Optional[torch.Tensor] = None
+        self.q_query_imag: Optional[torch.Tensor] = None
+        self.q_query_abs: Optional[torch.Tensor] = None
+        self.q_query_layers_seen: set[int] = set()
+
         self.q_samples: int = 0
         self.q_samples_at_last_update: int = 0
         self.calibrated: bool = False
@@ -144,7 +180,23 @@ class TriAttentionV3Engine:
         """Accumulate Q stats for one attention layer.
 
         q_pre_rope: [n_tokens, n_heads, head_dim] float (pre-RoPE).
+
+        Also captures the LAST cfg.query_tokens of each multi-token prefill
+        into the q_query_* buffers when cfg.lambda_query_attn > 0 — the
+        Tier 1 query-aware eviction signal. This runs even after
+        calibration is frozen because the user's question changes per turn.
         """
+        # Tier 1: capture query Q on every multi-token prefill, regardless
+        # of calibration state. This is OUTSIDE the calibrated-guard
+        # because the question is a per-turn signal, not a one-shot
+        # calibration pass.
+        if (
+            self.cfg.lambda_query_attn > 0.0
+            and 0 <= layer_idx < self.n_layers
+            and q_pre_rope.shape[0] >= self.cfg.query_min_window
+        ):
+            self._capture_query_q(q_pre_rope, layer_idx)
+
         if self.calibrated and not self.cfg.adaptive_calibration:
             return
         if not (0 <= layer_idx < self.n_layers):
@@ -185,6 +237,66 @@ class TriAttentionV3Engine:
                     and self.q_samples >= self.cfg.warmup_tokens
                 ):
                     self.update_calibration_locked()
+
+    def _capture_query_q(self, q_pre_rope: torch.Tensor, layer_idx: int) -> None:
+        """Tier 1: capture the LAST cfg.query_tokens of this prefill into
+        per-(layer, kv_head) query buffers. The buffers represent "the
+        user's most-recent question" at the layer dimensionality the trig
+        score uses — same shape as the calibration centers — so the score
+        kernel can blend trig and query-attention in the same pass.
+
+        Resets the buffer for THIS layer on every multi-token prefill of
+        this layer (each new user message overwrites the previous). The
+        per-layer reset assumption is: a multi-token forward of layer L
+        with shape[0] >= query_min_window means a new prefill is
+        in flight, not a partial decode batch.
+
+        See TriAttention V3 — 3-Tier Eviction Rescue Architecture
+        (obsidian) for the design rationale: trig score is the population
+        prior over future queries; query Q is the likelihood of the
+        actual current query.
+        """
+        fc = self.freq_count
+        T = int(q_pre_rope.shape[0])
+        n_take = min(int(self.cfg.query_tokens), T)
+        # Take the LAST n_take tokens — the user's question typically sits
+        # at the end of the prompt, after any system / few-shot scaffolding.
+        q = q_pre_rope[T - n_take : T, ..., : self.n_rot].to(torch.float32)
+        q_real = q[..., :fc]                 # [n_take, H, fc]
+        q_imag = q[..., fc : self.n_rot]
+        q_abs = torch.sqrt(q_real * q_real + q_imag * q_imag + 1e-8)
+
+        heads_per_kv = self.n_heads // self.n_kv_heads
+        q_real = q_real.view(-1, self.n_kv_heads, heads_per_kv, fc).mean(dim=2)
+        q_imag = q_imag.view(-1, self.n_kv_heads, heads_per_kv, fc).mean(dim=2)
+        q_abs = q_abs.view(-1, self.n_kv_heads, heads_per_kv, fc).mean(dim=2)
+        # Average over the n_take tokens — single per-(layer, kv_head)
+        # vector representing "the query."
+        mean_real = q_real.mean(dim=0)  # [n_kv_heads, fc]
+        mean_imag = q_imag.mean(dim=0)
+        mean_abs = q_abs.mean(dim=0)
+
+        with self._lock:
+            n_total = self.n_layers * self.n_kv_heads
+            if self.q_query_real is None:
+                self.q_query_real = torch.zeros(
+                    n_total, fc, dtype=self.dtype, device=self.device
+                )
+                self.q_query_imag = torch.zeros(
+                    n_total, fc, dtype=self.dtype, device=self.device
+                )
+                self.q_query_abs = torch.zeros(
+                    n_total, fc, dtype=self.dtype, device=self.device
+                )
+            base = layer_idx * self.n_kv_heads
+            self.q_query_real[base : base + self.n_kv_heads] = mean_real.to(self.dtype)
+            self.q_query_imag[base : base + self.n_kv_heads] = mean_imag.to(self.dtype)
+            self.q_query_abs[base : base + self.n_kv_heads] = mean_abs.to(self.dtype)
+            self.q_query_layers_seen.add(int(layer_idx))
+
+    def has_query_centers(self) -> bool:
+        """Tier 1 ready: query buffers populated for at least one layer."""
+        return self.q_query_real is not None and len(self.q_query_layers_seen) > 0
 
     def update_calibration(self) -> None:
         with self._lock:
@@ -331,6 +443,45 @@ class TriAttentionV3Engine:
             window_thr=window_thr,
             n_rot=self.n_rot,
         )
+        # Tier 1: blend in current-query orthogonality. The trig formula
+        # above measures K_P's orthogonality to the calibration centers
+        # (population prior over future queries) — high score = evict first.
+        # Doing the SAME computation against q_query_* gives K_P's
+        # orthogonality to the user's actual current query — high = current
+        # query won't attend to K_P (irrelevant now). Both signals share the
+        # "high = evict" convention, so they ADD.
+        #
+        # Walked through for NIAH (needle = relevant, junk = irrelevant):
+        #   * needle: trig HIGH (paper bug), query LOW (aligned w/ question)
+        #     → final = trig + λ·LOW
+        #   * junk:   trig HIGH, query HIGH → final = trig + λ·HIGH
+        # Junk's final > needle's final → top-K eviction picks junk first,
+        # needle survives. Subtraction would invert this and evict the
+        # needle harder; verified by counter-example.
+        #
+        # Same kernel, same shapes, same valid/window masking — only the
+        # centers change. λ=0 recovers paper-V3 exactly.
+        if (
+            self.cfg.lambda_query_attn > 0.0
+            and self.q_query_real is not None
+            and layer_il in self.q_query_layers_seen
+        ):
+            qr = self.q_query_real[cb : cb + self.n_kv_heads].to(scores.device)
+            qi = self.q_query_imag[cb : cb + self.n_kv_heads].to(scores.device)
+            qa = self.q_query_abs[cb : cb + self.n_kv_heads].to(scores.device)
+            query_score = score_cells_torch(
+                K=K.to(torch.float32),
+                center_real=qr.to(torch.float32),
+                center_imag=qi.to(torch.float32),
+                center_abs=qa.to(torch.float32),
+                omega=omega_d.to(torch.float32),
+                offsets=offsets_d.to(torch.float32),
+                max_pos=max_pos,
+                valid_mask=valid,
+                window_thr=window_thr,
+                n_rot=self.n_rot,
+            )
+            scores += float(self.cfg.lambda_query_attn) * query_score
         st["pending_n_blocks"] += self.n_kv_heads
 
     def finalize_evict_round(self, seq_id: int) -> int:
