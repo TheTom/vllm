@@ -648,55 +648,63 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
-            # TriAttention V3 Tier 2: stash prompt token IDs WORKER-SIDE
-            # so the eviction callback can decode evicted positions back
-            # to text. The previous wiring stashed them API-server-side in
-            # entrypoints/openai/chat_completion/serving.py, but the
-            # callback runs in EngineCore (worker) — separate Python
-            # globals — so the API-side stash was invisible to the
-            # callback and Tier 2 silently no-op'd. Detected by the AMD
-            # E2E rescue agent on 2026-05-07. The worker-side stash IS
-            # in the same process as the V3 engine; do it here.
+            # TriAttention V3 Tier 2: stash prompt token IDs + bind
+            # tokenizer WORKER-SIDE so the eviction callback can decode
+            # evicted positions back to text. Both halves co-located here
+            # because (a) it's the same process as the V3 engine (no
+            # APIServer ↔ EngineCore IPC issue), (b) `self.vllm_config`
+            # IS a real instance attr here (no `get_current_vllm_config`
+            # dispatch-thread issue), and (c) it runs on every new
+            # request — single hook point.
             #
-            # Tokenizer binding: ALSO done here (one-shot, gated on a
-            # module flag) because hooks.py:_lazy_init can't read
-            # `get_current_vllm_config()` from inside a forward-time
-            # custom-op dispatch (the per-thread context is unset).
-            # add_requests runs on the worker thread where
-            # `self.vllm_config` IS a real attr — that's the cleanest
-            # spot to do the AutoTokenizer load that decodes evicted
-            # token IDs back to text. ~milliseconds + tens-of-MB extra
-            # memory; gated to one-shot via the import-time class flag
-            # so we don't reload per request.
+            # Sub11 (2026-05-07) found the previous version's `try/except:
+            # pass` was silently swallowing the real failure. This version
+            # logs what's happening on the first call so layer-5 (if any)
+            # of the onion peel surfaces immediately.
             #
-            # Phase A is single-batch, so the engine's hardcoded
-            # `_SINGLE_SEQ_ID = 0` matches whichever request is current.
-            # Multi-batch will need a request-id → seq-id mapping (TODO
-            # alongside the multi-batch V3 work).
+            # Phase A is single-batch, so engine's `_SINGLE_SEQ_ID = 0`
+            # matches whichever request is current. Multi-batch needs
+            # request-id → seq-id plumbing (TODO with multi-batch V3).
+            from vllm.v1.attention.triattention import backend_helpers
             try:
-                from vllm.v1.attention.triattention import backend_helpers
                 backend_helpers.set_prompt_token_ids(
                     0, list(new_req_data.prompt_token_ids)
                 )
-                # One-shot tokenizer bind from the worker's vllm_config.
-                if backend_helpers._TOKENIZER is None:
-                    model_path = getattr(
-                        self.model_config, "tokenizer", None
-                    ) or getattr(self.model_config, "model", None)
-                    if model_path:
-                        try:
-                            from transformers import AutoTokenizer  # type: ignore
-                            tok = AutoTokenizer.from_pretrained(
-                                model_path, trust_remote_code=True
-                            )
-                            backend_helpers.set_tokenizer(tok)
-                        except Exception:  # noqa: BLE001
-                            # Tokenizer load is non-fatal — V3 still works
-                            # but eviction-to-longctx skips text decoding.
-                            pass
-            except Exception:  # noqa: BLE001
-                # V3 may not be installed / enabled in this run — silent.
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "TriAttention V3 set_prompt_token_ids failed for req "
+                    "%s: %s", req_id, exc,
+                )
+            # One-shot tokenizer bind from the worker's model_config. Log
+            # the load explicitly so we can see in the server log when
+            # the tokenizer becomes available to the eviction callback.
+            if backend_helpers._TOKENIZER is None:
+                model_path = getattr(
+                    self.model_config, "tokenizer", None
+                ) or getattr(self.model_config, "model", None)
+                if model_path:
+                    try:
+                        from transformers import AutoTokenizer  # type: ignore
+                        tok = AutoTokenizer.from_pretrained(
+                            model_path, trust_remote_code=True
+                        )
+                        backend_helpers.set_tokenizer(tok)
+                        logger.info(
+                            "TriAttention V3 Tier 2: tokenizer bound from "
+                            "%s on first add_requests (req=%s).",
+                            model_path, req_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "TriAttention V3 Tier 2: tokenizer load failed "
+                            "(model=%s): %s", model_path, exc,
+                        )
+                else:
+                    logger.warning(
+                        "TriAttention V3 Tier 2: no model_config.tokenizer "
+                        "or .model path; cannot bind tokenizer for "
+                        "eviction-to-text decoding.",
+                    )
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
