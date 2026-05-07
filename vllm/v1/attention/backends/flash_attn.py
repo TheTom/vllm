@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -774,6 +775,16 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
+            # TriAttention V3 hook — observer-only on the FA path (the K
+            # has already been written to `key_cache` by
+            # `do_kv_cache_update` above; we fire score accumulation +
+            # eviction-finalize on the per-chunk K). No-op when
+            # VLLM_TRIATT_FA_ENABLED != "1". When `LONGCTX_ENDPOINT` is
+            # also set, the eviction callback POSTs evicted spans to
+            # longctx-svc for next-turn rehydrate. Storage path is
+            # untouched — FA continues to attend to all cached positions.
+            self._maybe_fire_triattention_v3(layer, key, attn_metadata)
+
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -847,6 +858,84 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _maybe_fire_triattention_v3(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        attn_metadata: "FlashAttentionMetadata",
+    ) -> None:
+        """TriAttention V3 hook on the raw fp16 / non-TurboQuant path.
+
+        v0.5.x had V3's score accumulation + eviction-finalize wired only
+        inside `turboquant_attn.py` because that backend already had the
+        dequant'd K materialized for inverse-rotation. V3 itself is a
+        cache-eviction *policy* — it doesn't care about the storage codec
+        — so the hook works equally on raw fp16 K. This method makes that
+        explicit.
+
+        Opt-in via `VLLM_TRIATT_FA_ENABLED=1` so default FA flows are
+        bit-identical to upstream. When enabled:
+          - On prefill, fire `accumulate_prefill_k` with the THIS-CHUNK K.
+            `cached_len` is the post-append size (`new_kv_size_so_far`)
+            from `seq_lens`. `accumulate_prefill_k`'s duplicate-layer
+            detection handles multi-pass prefill if it happens.
+          - After the layer's score has been accumulated, fire
+            `maybe_finalize_evict` with the same effective seq_len.
+          - The Tier 2 eviction-to-longctx callback (registered via
+            `install_eviction_to_longctx`) fires if `LONGCTX_ENDPOINT`
+            is set — pushing evicted spans to the rescue store.
+
+        This is OBSERVER-ONLY for now: V3 picks evict_pos and pushes the
+        rescue spans to longctx-svc, but FlashAttention still attends to
+        ALL positions in the cache (including the "evicted" ones).
+        Cache compaction / mask injection is follow-up work — but for
+        the K=fp16 + Tier 1 isolation experiment AND for end-to-end Tier
+        2/3 rehydrate testing on dense models, observer-only is enough.
+        """
+        if not bool(int(os.environ.get("VLLM_TRIATT_FA_ENABLED", "0") or "0")):
+            return
+        if self.attn_type in (
+            AttentionType.ENCODER_ONLY, AttentionType.ENCODER
+        ):
+            return
+        # Lazy-import to avoid pulling V3 into FA's hot-path import graph
+        # when the feature is off.
+        from vllm.v1.attention.triattention.backend_helpers import (
+            accumulate_prefill_k as _v3_accumulate_prefill_k,
+            maybe_finalize_evict as _v3_maybe_finalize_evict,
+        )
+
+        # Only fire on prefill — decode steps are 1 token each and the
+        # score blends against centers built during prefill. q_len > 1
+        # is the indicator: max_query_len is the longest of any sequence
+        # in the batch; for pure decode it's 1.
+        if int(attn_metadata.max_query_len) <= 1:
+            return
+
+        # V3 expects K shaped [seq_len, n_kv_heads, head_dim]. FA stores
+        # `key` post-cache in [num_actual_tokens, n_kv_heads, head_dim],
+        # i.e. exactly that. Pass it through unchanged. `cached_len` is
+        # the post-append cache size for this sequence — for single-batch
+        # prefill that's `seq_lens[0]`. Multi-batch isn't supported on
+        # the V3 path yet (see backend_helpers `_SINGLE_SEQ_ID = 0`).
+        seq_lens = attn_metadata.seq_lens
+        if int(seq_lens.shape[0]) != 1:
+            return
+        cached_len = int(seq_lens[0].item())
+        try:
+            _v3_accumulate_prefill_k(
+                layer.layer_name, key, cached_len,
+            )
+            _v3_maybe_finalize_evict(
+                layer.layer_name, effective_seq_len=cached_len,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "TriAttention V3 FA hook raised %s: %s — disabling for "
+                "this layer; set VLLM_TRIATT_FA_ENABLED=0 to silence.",
+                type(exc).__name__, exc,
+            )
 
     def do_kv_cache_update(
         self,
