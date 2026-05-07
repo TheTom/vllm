@@ -166,53 +166,28 @@ def _lazy_init(device: torch.device) -> None:
         cfg.budget, cfg.window_size, cfg.prefix_protect, cfg.warmup_tokens,
     )
 
-    # Auto-install Tier 2/3 wiring at engine init — without this, the
+    # Auto-install Tier 2 callback at engine init — without this, the
     # rescue-callback registration only happens via unit tests, so the
     # eviction store stays empty in production and Tier 3 retrieval has
     # nothing to surface. Detected by the AMD E2E rescue agents on
-    # 2026-05-07 (5/5 needles failed identically with longctx ON vs OFF
-    # because /evict/write was never called, then because the eviction
-    # callback bailed on tokenizer=None).
+    # 2026-05-07.
     #
-    # Tokenizer note: vLLM v1 doesn't put a tokenizer instance on the
-    # worker (it lives on the API-server-side renderer). The eviction
-    # callback runs in EngineCore (worker) and needs to decode evicted
-    # token positions back to text. So we load a fresh AutoTokenizer
-    # instance worker-side from the model path. ~milliseconds at engine
-    # init, ~tens-of-MB extra memory — cheap compared to the rescue
-    # value when it actually fires.
+    # Tokenizer binding does NOT happen here — `get_current_vllm_config()`
+    # raises an AssertionError when called from a custom-op forward
+    # dispatch (the per-thread vllm-config context isn't set on this
+    # thread). The tokenizer load runs from the worker's add_requests
+    # path instead, where `self.vllm_config` is a real attr. See
+    # vllm/v1/worker/gpu/model_runner.py:add_requests.
     try:
         from vllm.v1.attention.triattention.backend_helpers import (
             install_eviction_to_longctx,
-            set_tokenizer,
         )
-        try:
-            vllm_cfg = get_current_vllm_config()
-            model_path = getattr(vllm_cfg.model_config, "tokenizer", None) \
-                or getattr(vllm_cfg.model_config, "model", None)
-            if model_path:
-                from transformers import AutoTokenizer  # type: ignore
-                tok = AutoTokenizer.from_pretrained(
-                    model_path, trust_remote_code=True
-                )
-                set_tokenizer(tok)
-                logger.info(
-                    "TriAttention V3 Tier 2: loaded tokenizer from %s for "
-                    "eviction-to-text decoding.", model_path,
-                )
-        except (AssertionError, AttributeError, ImportError, OSError) as exc:
-            # Tokenizer load is non-fatal — V3 itself still works, only
-            # rescue is gated on it. Log so it's visible.
-            logger.warning(
-                "TriAttention V3 Tier 2: tokenizer load failed (%s); "
-                "evict-to-longctx will skip text decoding until bound "
-                "via set_tokenizer().", exc,
-            )
         installed = install_eviction_to_longctx()
         if installed:
             logger.info(
                 "TriAttention V3 Tier 2 wired: eviction callback registered "
-                "and pointing at LONGCTX_ENDPOINT."
+                "and pointing at LONGCTX_ENDPOINT. Tokenizer binding will "
+                "happen on first add_requests (worker path)."
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

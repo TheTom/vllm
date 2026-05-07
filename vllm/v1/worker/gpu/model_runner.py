@@ -658,15 +658,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # E2E rescue agent on 2026-05-07. The worker-side stash IS
             # in the same process as the V3 engine; do it here.
             #
+            # Tokenizer binding: ALSO done here (one-shot, gated on a
+            # module flag) because hooks.py:_lazy_init can't read
+            # `get_current_vllm_config()` from inside a forward-time
+            # custom-op dispatch (the per-thread context is unset).
+            # add_requests runs on the worker thread where
+            # `self.vllm_config` IS a real attr — that's the cleanest
+            # spot to do the AutoTokenizer load that decodes evicted
+            # token IDs back to text. ~milliseconds + tens-of-MB extra
+            # memory; gated to one-shot via the import-time class flag
+            # so we don't reload per request.
+            #
             # Phase A is single-batch, so the engine's hardcoded
             # `_SINGLE_SEQ_ID = 0` matches whichever request is current.
             # Multi-batch will need a request-id → seq-id mapping (TODO
             # alongside the multi-batch V3 work).
             try:
-                from vllm.v1.attention.triattention.backend_helpers import (
-                    set_prompt_token_ids,
+                from vllm.v1.attention.triattention import backend_helpers
+                backend_helpers.set_prompt_token_ids(
+                    0, list(new_req_data.prompt_token_ids)
                 )
-                set_prompt_token_ids(0, list(new_req_data.prompt_token_ids))
+                # One-shot tokenizer bind from the worker's vllm_config.
+                if backend_helpers._TOKENIZER is None:
+                    model_path = getattr(
+                        self.model_config, "tokenizer", None
+                    ) or getattr(self.model_config, "model", None)
+                    if model_path:
+                        try:
+                            from transformers import AutoTokenizer  # type: ignore
+                            tok = AutoTokenizer.from_pretrained(
+                                model_path, trust_remote_code=True
+                            )
+                            backend_helpers.set_tokenizer(tok)
+                        except Exception:  # noqa: BLE001
+                            # Tokenizer load is non-fatal — V3 still works
+                            # but eviction-to-longctx skips text decoding.
+                            pass
             except Exception:  # noqa: BLE001
                 # V3 may not be installed / enabled in this run — silent.
                 pass
