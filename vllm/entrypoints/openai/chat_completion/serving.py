@@ -248,6 +248,22 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+        # TriAttention V3 + longctx Tier 3 rehydrate: if longctx is
+        # configured AND the session has evicted spans relevant to this
+        # turn's user question, prepend a system message with the
+        # rescued context BEFORE rendering. Safe no-op when LONGCTX_ENDPOINT
+        # is unset or the session is fresh.
+        try:
+            from vllm.v1.attention.triattention.prefill_rehydrate import (
+                maybe_rehydrate_messages,
+            )
+            new_messages, n_injected = maybe_rehydrate_messages(request.messages)
+            if n_injected > 0:
+                request.messages = new_messages  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001
+            # Hook failure must never break chat completion. The rescue
+            # path is opt-in via LONGCTX_ENDPOINT and additive only.
+            pass
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -274,6 +290,20 @@ class OpenAIServingChat(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+
+            # TriAttention V3 + longctx Tier 2: stash the tokenised prompt
+            # so the V3 eviction callback can decode evicted positions
+            # back to text on each subsequent eviction round. No-op when
+            # LONGCTX_ENDPOINT is unset. Phase A is single-batch
+            # (seq_id=0); the engine input already represents a single
+            # prompt path so we just hand off the token IDs verbatim.
+            try:
+                from vllm.v1.attention.triattention.prefill_rehydrate import (
+                    stash_prompt_token_ids,
+                )
+                stash_prompt_token_ids(prompt_token_ids)
+            except Exception:  # noqa: BLE001
+                pass
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
