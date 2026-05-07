@@ -648,6 +648,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
+            # TriAttention V3 Tier 2: stash prompt token IDs WORKER-SIDE
+            # so the eviction callback can decode evicted positions back
+            # to text. The previous wiring stashed them API-server-side in
+            # entrypoints/openai/chat_completion/serving.py, but the
+            # callback runs in EngineCore (worker) — separate Python
+            # globals — so the API-side stash was invisible to the
+            # callback and Tier 2 silently no-op'd. Detected by the AMD
+            # E2E rescue agent on 2026-05-07. The worker-side stash IS
+            # in the same process as the V3 engine; do it here.
+            #
+            # Phase A is single-batch, so the engine's hardcoded
+            # `_SINGLE_SEQ_ID = 0` matches whichever request is current.
+            # Multi-batch will need a request-id → seq-id mapping (TODO
+            # alongside the multi-batch V3 work).
+            try:
+                from vllm.v1.attention.triattention.backend_helpers import (
+                    set_prompt_token_ids,
+                )
+                set_prompt_token_ids(0, list(new_req_data.prompt_token_ids))
+            except Exception:  # noqa: BLE001
+                # V3 may not be installed / enabled in this run — silent.
+                pass
+
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.

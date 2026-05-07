@@ -166,6 +166,44 @@ def _lazy_init(device: torch.device) -> None:
         cfg.budget, cfg.window_size, cfg.prefix_protect, cfg.warmup_tokens,
     )
 
+    # Auto-install Tier 2/3 wiring at engine init — without this, the
+    # rescue-callback registration only happens via unit tests, so the
+    # eviction store stays empty in production and Tier 3 retrieval has
+    # nothing to surface. Detected by the AMD E2E rescue agent on
+    # 2026-05-07 (5/5 needles failed identically with longctx ON vs OFF
+    # because /evict/write was never called).
+    #
+    # Both calls are safe no-ops when their preconditions aren't met
+    # (LONGCTX_ENDPOINT unset, or tokenizer can't be resolved from the
+    # worker's VllmConfig).
+    try:
+        from vllm.v1.attention.triattention.backend_helpers import (
+            install_eviction_to_longctx,
+            set_tokenizer,
+        )
+        from vllm.config import get_current_vllm_config
+        try:
+            vllm_cfg = get_current_vllm_config()
+            tok = getattr(vllm_cfg, "tokenizer", None)
+            if tok is not None:
+                set_tokenizer(tok)
+        except (AssertionError, AttributeError):
+            # Tokenizer not yet available on this thread — backend_helpers
+            # logs a warning the first time the callback fires without it,
+            # but the engine itself stays alive and useful.
+            pass
+        installed = install_eviction_to_longctx()
+        if installed:
+            logger.info(
+                "TriAttention V3 Tier 2 wired: eviction callback registered "
+                "and pointing at LONGCTX_ENDPOINT."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "TriAttention V3 Tier 2 auto-install failed: %s — V3 still works "
+            "but evict-to-longctx rescue is disabled.", exc,
+        )
+
 
 def _capture_q_impl(q: torch.Tensor, layer_idx: int) -> None:
     """Inner implementation; signature matches the registered torch op
