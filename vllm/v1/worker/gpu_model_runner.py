@@ -1129,6 +1129,61 @@ class GPUModelRunner(
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
 
+        # TriAttention V3 Tier 2 wiring — worker-side stash of prompt
+        # token IDs + one-shot tokenizer bind. Both required for the
+        # eviction callback to decode evicted positions back to text.
+        # This is the LIVE GPUModelRunner (vllm/v1/worker/gpu_model_runner.py),
+        # NOT the package-version dead twin at vllm/v1/worker/gpu/model_runner.py
+        # — sub13 traced down the file-name collision after multiple
+        # rounds of patching the wrong file. Engine imports
+        # `vllm.v1.worker.gpu_model_runner` (flat); the dead `gpu/`
+        # subpackage just shares a class name.
+        n_new_v3 = len(scheduler_output.scheduled_new_reqs)
+        if n_new_v3 > 0:
+            try:
+                from vllm.v1.attention.triattention import backend_helpers
+                first_req = scheduler_output.scheduled_new_reqs[0]
+                # Phase A is single-batch — engine hardcodes seq_id=0.
+                # Stash the first new req's tokens; multi-batch needs
+                # request-id → seq-id mapping (TODO with multi-batch V3).
+                backend_helpers.set_prompt_token_ids(
+                    0, list(first_req.prompt_token_ids)
+                )
+                # One-shot tokenizer bind. self.model_config is a real
+                # attr here (this runs on the worker thread, not in a
+                # custom-op dispatch context).
+                if backend_helpers._TOKENIZER is None:
+                    model_path = getattr(
+                        self.model_config, "tokenizer", None
+                    ) or getattr(self.model_config, "model", None)
+                    if model_path:
+                        try:
+                            from transformers import AutoTokenizer  # type: ignore
+                            tok = AutoTokenizer.from_pretrained(
+                                model_path, trust_remote_code=True
+                            )
+                            backend_helpers.set_tokenizer(tok)
+                            logger.info(
+                                "TriAttention V3 Tier 2: tokenizer bound "
+                                "from %s on first scheduled_new_reqs.",
+                                model_path,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "TriAttention V3 Tier 2: tokenizer load "
+                                "failed (model=%s): %s", model_path, exc,
+                            )
+                    else:
+                        logger.warning(
+                            "TriAttention V3 Tier 2: no model_config."
+                            "tokenizer or .model path; eviction-to-text "
+                            "decoding disabled."
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "TriAttention V3 Tier 2 worker hook failed: %s", exc,
+                )
+
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
