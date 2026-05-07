@@ -643,6 +643,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # Diagnostic: prove add_requests fires + count incoming new reqs.
+        # Sub12 confirmed inspect.getsource() shows our patch IS loaded
+        # but no patch-side log lines fired. Either this method doesn't
+        # run on AMD's request path, or scheduled_new_reqs is empty when
+        # it does run. This INFO line settles it. Remove once stable.
+        n_new = len(scheduler_output.scheduled_new_reqs)
+        if n_new > 0:
+            logger.info(
+                "[V3-DIAG] add_requests fired with %d new req(s)", n_new,
+            )
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
