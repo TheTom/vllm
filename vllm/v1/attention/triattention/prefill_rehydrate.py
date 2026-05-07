@@ -35,6 +35,24 @@ _SCORE_FLOOR = float(os.environ.get("VLLM_TRIATT_RESCUE_FLOOR", "0.20"))
 _MAX_INJECTED_CHARS = int(
     os.environ.get("VLLM_TRIATT_RESCUE_MAX_CHARS", "8000")
 )
+# Query-signal extraction mode for /evict/retrieve. Sub21 (2026-05-07)
+# found that passing the entire user message — typically a long
+# haystack + a short question — as the query string drowned the
+# question signal in MiniLM embedding (cosine sim picks chunks by
+# bulk lexical content; haystack-themed filler beats fact chunks 4x).
+# Extracting JUST the question text gives the embedder the
+# discriminating signal and flips ranking 50x.
+#
+# Modes:
+#   "question" — split on "QUESTION:" marker, take the trailing piece.
+#                NIAH-specific format; safe fallback to tail mode.
+#   "tail"     — last N chars of the user message. Generic default,
+#                works for typical chat turns where the question is
+#                at the end.
+#   "full"     — original behavior, pass the whole message. Disabled
+#                by default; available as escape hatch.
+_QUERY_MODE = os.environ.get("VLLM_TRIATT_RESCUE_QUERY_MODE", "question")
+_QUERY_TAIL = int(os.environ.get("VLLM_TRIATT_RESCUE_QUERY_TAIL", "512"))
 
 
 def _last_user_text(messages: list[dict] | list[Any]) -> str | None:
@@ -106,6 +124,40 @@ def _format_rehydrate_system_message(chunks: list[dict]) -> str:
     return header + "".join(body_parts)
 
 
+def _extract_query_signal(user_text: str) -> str:
+    """Extract a short discriminating query string from a potentially-
+    very-long user message. The full message is what the model needs
+    to attend to, but the SEMANTIC RETRIEVAL QUERY needs to be just
+    the question — otherwise MiniLM embeds the bulk haystack content
+    and ranks chunks by filler-similarity instead of question-similarity.
+
+    Modes (env-tunable via VLLM_TRIATT_RESCUE_QUERY_MODE):
+      "question" — find the last "QUESTION:" marker (case-insensitive)
+                   and return the trailing piece. NIAH-style harnesses
+                   often inject this. Falls through to "tail" if no
+                   marker is present.
+      "tail"     — return the last `VLLM_TRIATT_RESCUE_QUERY_TAIL`
+                   chars of the message. Generic default.
+      "full"     — return the full message (original-but-broken
+                   behavior). Available as escape hatch only.
+    """
+    if _QUERY_MODE == "full":
+        return user_text
+    if _QUERY_MODE == "question":
+        # Case-insensitive search for the LAST "QUESTION:" marker.
+        marker_lower = user_text.lower()
+        idx = marker_lower.rfind("question:")
+        if idx >= 0:
+            tail = user_text[idx + len("question:"):].strip()
+            if tail:
+                return tail
+        # Fall through to tail mode.
+    # "tail" or fallthrough from "question"
+    if len(user_text) <= _QUERY_TAIL:
+        return user_text
+    return user_text[-_QUERY_TAIL:]
+
+
 def maybe_rehydrate_messages(
     messages: list[dict] | list[Any],
 ) -> tuple[list, int]:
@@ -124,13 +176,19 @@ def maybe_rehydrate_messages(
     user_text = _last_user_text(messages)
     if not user_text:
         return list(messages), 0
+    # Extract the discriminating retrieval signal from the user message.
+    # Critical: passing the full user_text drowns the question in
+    # haystack content (sub21 2026-05-07 — cosine sim filler 0.562 vs
+    # fact 0.149 with full query; flips to fact 0.890 vs filler 0.070
+    # with question only).
+    query_signal = _extract_query_signal(user_text)
     # Lazy-import to avoid pulling backend_helpers at module load
     from vllm.v1.attention.triattention.backend_helpers import (
         retrieve_evicted_for_query,
     )
     try:
         chunks = retrieve_evicted_for_query(
-            user_text, top_k=_TOP_K, score_floor=_SCORE_FLOOR,
+            query_signal, top_k=_TOP_K, score_floor=_SCORE_FLOOR,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
