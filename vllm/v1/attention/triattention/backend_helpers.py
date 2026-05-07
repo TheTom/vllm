@@ -67,8 +67,18 @@ def set_prompt_token_ids(seq_id: int, token_ids: list[int]) -> None:
     """Stash the prompt's token IDs for a session so the eviction
     callback can decode evicted positions back to text. Called from
     the prefill hook with the freshly-tokenized prompt.
+
+    Also resets V3's per-seq state (valid_mask, pending score round,
+    n_evicted) for this seq_id. Each new request is a fresh sequence
+    from V3's POV; without the reset, the stale valid_mask from a
+    prior request masks out positions in the new request's freshly-
+    allocated KV — the f1 failure mode sub15 traced.
     """
     _PROMPT_TOKEN_IDS[int(seq_id)] = list(token_ids)
+    from vllm.v1.attention.triattention.hooks import get_engine
+    eng = get_engine()
+    if eng is not None:
+        eng.reset_seq_state(int(seq_id))
 
 
 def set_tokenizer(tok) -> None:

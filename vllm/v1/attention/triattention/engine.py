@@ -365,6 +365,41 @@ class TriAttentionV3Engine:
             return new
         return m[:seq_len]
 
+    def reset_seq_state(self, seq_id: int) -> None:
+        """Per-request fresh start. Drops the valid_mask, pending score
+        round, and n_evicted counter for `seq_id`. Calibration centers
+        + total_evict_rounds are PROCESS-global and intentionally NOT
+        reset — they're meaningful aggregates across the lifetime of
+        the engine.
+
+        Why this matters: pre-2026-05-07 the valid_mask carried over
+        between vLLM serve requests because Phase A hardcodes
+        `_SINGLE_SEQ_ID = 0` and `get_valid_mask` re-emits the stale
+        mask whenever incoming seq_len <= prior seq_len. The TQ
+        attention kernel's VALID_MASK constexpr would then mask out
+        positions in the NEW request's freshly-allocated KV using the
+        PRIOR request's eviction set — a positional-coordinate stale
+        mask masking its own rescue. Sub15's f1-only failure on the
+        multiq harness traced to exactly this: turn 1 evicted positions
+        4000-4500 (where badger text lived in haystack), turn 2's
+        rehydrate prepended badger text at positions 100-600 and
+        shifted the haystack — but the kernel still skipped 4000-4500
+        which now held SHIFTED haystack content the model needed.
+        Reset on per-request hook closes the gap.
+        """
+        st = self._seq_state.get(seq_id)
+        if st is None:
+            return
+        st["valid_mask"] = None
+        st["n_evicted"] = 0
+        st["max_pos"] = -1
+        # Drop any open score round — caller will begin a fresh one
+        # if more prefill is incoming. Keep `evict_rounds` since it's a
+        # cumulative telemetry counter, not per-sequence state.
+        for k in ("pending_scores", "pending_n_blocks",
+                  "pending_seq_len", "pending_layers"):
+            st.pop(k, None)
+
     def n_used(self, seq_id: int, seq_len: int) -> int:
         st = self._seq_state.get(seq_id)
         if st is None or st["valid_mask"] is None:
