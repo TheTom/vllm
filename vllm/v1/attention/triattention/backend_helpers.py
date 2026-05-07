@@ -88,6 +88,90 @@ def set_tokenizer(tok) -> None:
     _TOKENIZER = tok
 
 
+# Sub22 finding (2026-05-07): on the FIRST prefill of a new session,
+# the rescue store is empty (no eviction round has fired yet), so
+# Tier 3 retrieve returns 0 chunks and V3 alone collapses at low
+# budget. Prepopulating the rescue store with the prompt's text gives
+# turn 1 something to surface while leaving subsequent turns to V3's
+# real evicted spans. Env-gated to keep the default A/B contrast clean.
+_PREPOPULATE_ENABLED = os.environ.get(
+    "VLLM_TRIATT_PREPOPULATE_TURN1", "0"
+) == "1"
+_PREPOPULATE_SPAN_TOKENS = int(
+    os.environ.get("VLLM_TRIATT_PREPOPULATE_SPAN", "256")
+)
+_PREPOPULATED_SESSIONS: set[str] = set()
+
+
+def prepopulate_rescue_store(seq_id: int) -> int:
+    """Pre-fill longctx-svc with the current prompt's text as synthetic
+    eviction chunks, so turn 1's Tier 3 retrieve has something to surface.
+
+    No-op when:
+      * VLLM_TRIATT_PREPOPULATE_TURN1 != "1"
+      * tokenizer or prompt token IDs not yet bound
+      * LONGCTX_ENDPOINT not set
+      * this longctx session has already been prepopulated this run
+
+    Chunks are written with layer=-2, score=-1.0 to mark them synthetic
+    (distinguishable from real V3 evictions in /evict/dump for telemetry).
+    """
+    if not _PREPOPULATE_ENABLED:
+        return 0
+    base = _get_longctx_base_url()
+    if not base:
+        return 0
+    if _TOKENIZER is None:
+        return 0
+    token_ids = _PROMPT_TOKEN_IDS.get(int(seq_id))
+    if not token_ids:
+        return 0
+    if _LONGCTX_SESSION_ID in _PREPOPULATED_SESSIONS:
+        return 0
+
+    span = max(64, _PREPOPULATE_SPAN_TOKENS)
+    chunks_payload: list[dict] = []
+    for s in range(0, len(token_ids), span):
+        e = min(len(token_ids), s + span)
+        try:
+            text = _TOKENIZER.decode(
+                token_ids[s:e], skip_special_tokens=True,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if not text.strip():
+            continue
+        chunks_payload.append({
+            "text": text,
+            "token_range": (int(s), int(e)),
+            "layer": -2,    # synthetic prepopulate marker
+            "score": -1.0,
+        })
+    if not chunks_payload:
+        return 0
+
+    url = base.rstrip("/") + "/evict/write"
+    try:
+        sess = _get_http_session()
+        sess.post(url, json={
+            "session_id": _LONGCTX_SESSION_ID,
+            "chunks": chunks_payload,
+        }, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "TriAttention V3 prepopulate POST to %s failed: %s",
+            url, exc,
+        )
+        return 0
+    _PREPOPULATED_SESSIONS.add(_LONGCTX_SESSION_ID)
+    logger.info(
+        "TriAttention V3 prepopulate: posted %d synthetic chunks "
+        "(span=%d) for session %s — turn-1 rescue armed.",
+        len(chunks_payload), span, _LONGCTX_SESSION_ID,
+    )
+    return len(chunks_payload)
+
+
 def set_longctx_session_id(session_id: str) -> None:
     """Set the longctx-svc session id used by /evict/write + /retrieve.
     Default is `v3-single-session`; per-request batches will need

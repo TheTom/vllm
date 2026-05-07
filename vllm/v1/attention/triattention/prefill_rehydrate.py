@@ -213,13 +213,20 @@ def maybe_rehydrate_messages(
 def stash_prompt_token_ids(prompt_token_ids: list[int] | None) -> None:
     """Capture the tokenised prompt for the V3 eviction callback so it
     can decode evicted positions back to text. Phase A is single-batch
-    (seq_id=0); future multi-batch will require request-id plumbing."""
+    (seq_id=0); future multi-batch will require request-id plumbing.
+
+    When VLLM_TRIATT_PREPOPULATE_TURN1=1, also seeds the rescue store
+    with the prompt's text as synthetic chunks so the very-first turn's
+    Tier 3 retrieve has something to surface (otherwise turn 1 always
+    misses; sub22 2026-05-07).
+    """
     if not prompt_token_ids:
         return
     if not os.environ.get("LONGCTX_ENDPOINT"):
         return
     # Avoid pulling backend_helpers at module load; lazy-import here.
     from vllm.v1.attention.triattention.backend_helpers import (
-        set_prompt_token_ids,
+        set_prompt_token_ids, prepopulate_rescue_store,
     )
     set_prompt_token_ids(0, list(prompt_token_ids))
+    prepopulate_rescue_store(0)
