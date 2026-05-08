@@ -120,6 +120,9 @@ def _isolate_module_state(monkeypatch):
     monkeypatch.setattr(backend_helpers, "_LONGCTX_BASE_URL", None)
     monkeypatch.setattr(backend_helpers, "_LONGCTX_HTTP", None)
     monkeypatch.setattr(
+        backend_helpers, "_DEFAULT_LONGCTX_SESSION_ID", "v3-single-session"
+    )
+    monkeypatch.setattr(
         backend_helpers, "_LONGCTX_SESSION_ID", "v3-single-session"
     )
     # Env: clear LONGCTX_ENDPOINT for default no-op behaviour. Tests that
@@ -581,6 +584,49 @@ class TestMaybeRehydrateMessages:
         prefill_rehydrate.maybe_rehydrate_messages(msgs)
         assert "part A" in captured["query"]
         assert "part B" in captured["query"]
+
+
+# ---------------------------------------------------------------------------
+# Tier 2/3: longctx session id plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestLongctxSessionIds:
+
+    def test_set_resets_to_default_for_missing_id(self):
+        backend_helpers.set_longctx_session_id("prd10m-armC-123")
+        assert backend_helpers._LONGCTX_SESSION_ID == "prd10m-armC-123"
+
+        effective = backend_helpers.set_longctx_session_id(None)
+
+        assert effective == "v3-single-session"
+        assert backend_helpers._LONGCTX_SESSION_ID == "v3-single-session"
+
+    def test_request_id_round_trip_for_worker_process(self):
+        request_id = "chatcmpl-abc123"
+        session_id = "prd10m-armC-123/with spaces"
+
+        encoded = backend_helpers.encode_request_id_with_longctx_session(
+            request_id, session_id,
+        )
+
+        assert encoded.startswith(request_id)
+        assert encoded != request_id
+        assert backend_helpers.extract_longctx_session_id_from_request_id(
+            encoded
+        ) == session_id
+
+    def test_default_session_does_not_pollute_request_id(self):
+        request_id = "chatcmpl-abc123"
+
+        encoded = backend_helpers.encode_request_id_with_longctx_session(
+            request_id, "v3-single-session",
+        )
+
+        assert encoded == request_id
+        assert backend_helpers.extract_longctx_session_id_from_request_id(
+            encoded
+        ) == "v3-single-session"
 
 
 # ---------------------------------------------------------------------------

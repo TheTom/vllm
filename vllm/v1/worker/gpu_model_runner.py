@@ -1143,6 +1143,11 @@ class GPUModelRunner(
             try:
                 from vllm.v1.attention.triattention import backend_helpers
                 first_req = scheduler_output.scheduled_new_reqs[0]
+                backend_helpers.set_longctx_session_id(
+                    backend_helpers.extract_longctx_session_id_from_request_id(
+                        first_req.req_id,
+                    )
+                )
                 # Phase A is single-batch — engine hardcodes seq_id=0.
                 # Stash the first new req's tokens; multi-batch needs
                 # request-id → seq-id mapping (TODO with multi-batch V3).

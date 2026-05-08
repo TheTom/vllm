@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
+from urllib.parse import quote, unquote
 
 import torch
 
@@ -57,7 +58,11 @@ _PROMPT_TOKEN_IDS: dict[int, list[int]] = {}
 _TOKENIZER = None
 # Per-session id ↔ longctx session id mapping. Phase A is single-batch
 # (all V3 work happens at seq_id=0), so we store a single string here.
-_LONGCTX_SESSION_ID: str = "v3-single-session"
+_DEFAULT_LONGCTX_SESSION_ID: str = os.environ.get(
+    "VLLM_TRIATT_LONGCTX_SESSION_ID", "v3-single-session"
+)
+_LONGCTX_SESSION_ID: str = _DEFAULT_LONGCTX_SESSION_ID
+_LONGCTX_REQUEST_ID_MARKER = "__longctx_session="
 # Tier 2 endpoint config. Read once from env at first use.
 _LONGCTX_BASE_URL: Optional[str] = None
 _LONGCTX_HTTP = None  # requests.Session, lazy-built
@@ -172,13 +177,67 @@ def prepopulate_rescue_store(seq_id: int) -> int:
     return len(chunks_payload)
 
 
-def set_longctx_session_id(session_id: str) -> None:
+def resolve_longctx_session_id(session_id: str | None = None) -> str:
+    """Return a concrete longctx session id.
+
+    Empty / missing ids intentionally resolve back to the process default
+    so a header-bearing request cannot leak its session into the next
+    request that omits the header.
+    """
+    if session_id is not None:
+        normalized = str(session_id).strip()
+        if normalized:
+            return normalized
+    return _DEFAULT_LONGCTX_SESSION_ID
+
+
+def set_longctx_session_id(session_id: str | None = None) -> str:
     """Set the longctx-svc session id used by /evict/write + /retrieve.
-    Default is `v3-single-session`; per-request batches will need
-    request-id plumbing in a future phase.
+    Empty / missing ids reset to the default singleton session.
+
+    Returns the effective session id so callers can log or encode it.
     """
     global _LONGCTX_SESSION_ID
-    _LONGCTX_SESSION_ID = str(session_id)
+    _LONGCTX_SESSION_ID = resolve_longctx_session_id(session_id)
+    return _LONGCTX_SESSION_ID
+
+
+def encode_request_id_with_longctx_session(
+    request_id: str, session_id: str | None = None,
+) -> str:
+    """Append the longctx session id to an internal engine request id.
+
+    The OpenAI API process sees request headers, but EngineCore runs in a
+    separate worker process. Encoding the session into the engine request
+    id gives the worker-side prompt-token stash / eviction callback the
+    same longctx session without adding a new scheduler field.
+    """
+    session = resolve_longctx_session_id(session_id)
+    if session == _DEFAULT_LONGCTX_SESSION_ID:
+        return request_id
+    marker = "::" + _LONGCTX_REQUEST_ID_MARKER
+    if marker in request_id:
+        return request_id
+    return f"{request_id}{marker}{quote(session, safe='')}"
+
+
+def extract_longctx_session_id_from_request_id(
+    request_id: str | None,
+) -> str:
+    """Recover an encoded longctx session id from an engine request id.
+
+    Returns the default singleton session when no marker is present.
+    """
+    if not request_id:
+        return _DEFAULT_LONGCTX_SESSION_ID
+    marker = "::" + _LONGCTX_REQUEST_ID_MARKER
+    idx = str(request_id).rfind(marker)
+    if idx < 0:
+        return _DEFAULT_LONGCTX_SESSION_ID
+    encoded = str(request_id)[idx + len(marker):]
+    if not encoded:
+        return _DEFAULT_LONGCTX_SESSION_ID
+    return resolve_longctx_session_id(unquote(encoded))
 
 
 def _get_longctx_base_url() -> Optional[str]:

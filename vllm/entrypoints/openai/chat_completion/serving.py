@@ -83,6 +83,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_LONGCTX_SESSION_HEADERS = (
+    "x-longctx-session",
+    "x-longctx-session-id",
+)
+
+
+def _triattention_longctx_session_from_request(
+    raw_request: Request | None,
+) -> str | None:
+    """Read the optional longctx rescue session id from HTTP headers."""
+    if raw_request is None:
+        return None
+    for header in _LONGCTX_SESSION_HEADERS:
+        value = raw_request.headers.get(header)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -248,6 +267,22 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+        # TriAttention V3 + longctx session plumbing. The API process
+        # sees request headers, while the worker process owns eviction
+        # callbacks. Set the API-side session before Tier 3 retrieval;
+        # the internal engine request id is encoded below so the worker
+        # can recover the same session before Tier 2 /evict/write.
+        longctx_session_id = _triattention_longctx_session_from_request(
+            raw_request
+        )
+        try:
+            from vllm.v1.attention.triattention.backend_helpers import (
+                set_longctx_session_id,
+            )
+            longctx_session_id = set_longctx_session_id(longctx_session_id)
+        except Exception:  # noqa: BLE001
+            pass
+
         # TriAttention V3 + longctx Tier 3 rehydrate: if longctx is
         # configured AND the session has evicted spans relevant to this
         # turn's user question, prepend a system message with the
@@ -310,6 +345,16 @@ class OpenAIServingChat(OpenAIServing):
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
+            engine_request_id = sub_request_id
+            try:
+                from vllm.v1.attention.triattention.backend_helpers import (
+                    encode_request_id_with_longctx_session,
+                )
+                engine_request_id = encode_request_id_with_longctx_session(
+                    sub_request_id, longctx_session_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
             max_tokens = get_max_tokens(
                 max_model_len,
@@ -348,7 +393,7 @@ class OpenAIServingChat(OpenAIServing):
             if isinstance(sampling_params, BeamSearchParams):
                 generator = self.beam_search(
                     prompt=engine_input,
-                    request_id=sub_request_id,
+                    request_id=engine_request_id,
                     params=sampling_params,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
@@ -371,7 +416,7 @@ class OpenAIServingChat(OpenAIServing):
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,
-                    sub_request_id,
+                    engine_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
                     priority=request.priority,
