@@ -572,6 +572,13 @@ class TriAttentionV3Engine:
             n_segments=self.cfg.n_segments,
             mode=self.cfg.hybrid_mode,
         )
+        # Defensive: clamp evict_pos to valid_mask's range BEFORE the
+        # in-place scatter. A stale aliased view in select_v3_evictions
+        # (post-multi-round) is the prime suspect for the round-6
+        # hipErrorIllegalAddress on ROCm. Clamp first, dedupe second.
+        if evict_pos.numel() > 0:
+            evict_pos = evict_pos.clamp_(0, valid.shape[0] - 1)
+            evict_pos = torch.unique(evict_pos)
         valid[evict_pos] = False
         n_evicted = int(evict_pos.numel())
         st["n_evicted"] += n_evicted
@@ -592,14 +599,34 @@ class TriAttentionV3Engine:
         # logged but suppressed so a misbehaving rescue path can't crash
         # decoding.
         if self._eviction_callback is not None and n_evicted > 0:
+            # Round-6 ROCm `hipErrorIllegalAddress` fix (2026-05-07):
+            # Move evict_pos to CPU on the engine's stream BEFORE handing
+            # to the callback, and synchronize. The async _to_copy from
+            # inside the callback was the trip-wire; doing it here under
+            # explicit sync isolates round-N memory state from round-N+1.
+            # `clone().contiguous()` breaks any view aliasing with valid /
+            # candidate_pos so the policy's intermediate tensors can free.
             try:
-                self._eviction_callback(seq_id, evict_pos, n_evicted)
+                ep = evict_pos.detach().clone().contiguous()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device=ep.device)
+                evict_pos_cpu = ep.cpu()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "TriAttention V3 eviction callback raised %s: %s — "
-                    "suppressed to keep eviction running.",
-                    type(exc).__name__, exc,
+                    "TriAttention V3 evict_pos materialise failed: %s — "
+                    "skipping callback for round %d.",
+                    exc, self.total_evict_rounds,
                 )
+                evict_pos_cpu = None
+            if evict_pos_cpu is not None:
+                try:
+                    self._eviction_callback(seq_id, evict_pos_cpu, n_evicted)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "TriAttention V3 eviction callback raised %s: %s — "
+                        "suppressed to keep eviction running.",
+                        type(exc).__name__, exc,
+                    )
         return n_evicted
 
     def set_eviction_callback(
