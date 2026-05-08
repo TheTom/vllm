@@ -107,7 +107,21 @@ def _resolve_dims_from_vllm_config() -> Optional[dict]:
     n_heads = hf.num_attention_heads
     n_kv_heads = getattr(hf, "num_key_value_heads", n_heads)
     head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // n_heads
-    rope_theta = float(getattr(hf, "rope_theta", 10000.0))
+    # Llama 4 / some Llama variants store rope_theta inside the
+    # `rope_parameters` dict instead of as a top-level attribute.
+    # Fall back to that shape before defaulting to 10000.0 (the latter
+    # is RIGHT for early Llama / Qwen2 32K, WRONG for Llama 4 = 500000
+    # and Qwen2.5 1M = 10000000). Env override wins.
+    env_theta = os.environ.get("VLLM_TRIATT_ROPE_THETA")
+    if env_theta is not None:
+        rope_theta = float(env_theta)
+    else:
+        rope_theta = getattr(hf, "rope_theta", None)
+        if rope_theta is None:
+            rp = getattr(hf, "rope_parameters", None)
+            if isinstance(rp, dict):
+                rope_theta = rp.get("rope_theta")
+        rope_theta = float(rope_theta) if rope_theta is not None else 10000.0
     partial = getattr(hf, "partial_rotary_factor", None)
     n_rot = head_dim if partial is None else int(round(head_dim * float(partial)))
     return {
