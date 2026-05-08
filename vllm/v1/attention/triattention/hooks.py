@@ -226,6 +226,17 @@ def _capture_q_impl(q: torch.Tensor, layer_idx: int) -> None:
     else:
         return
     eng.accumulate_q(q.detach(), int(layer_idx))
+    # ROCm round-6 stream-poison fix (2026-05-07): the cumulative
+    # `.to(torch.float32)` casts inside accumulate_q + _capture_query_q
+    # leave the HIP runtime in an error state by chunk 8 of chunked
+    # prefill, which surfaces as `SetDevice` failure inside the next
+    # kernel (vLLM's `rotary_embedding`). Forcing a synchronize at the
+    # hook boundary either clears the error or surfaces it deterministically
+    # inside V3 for triage instead of poisoning the model's RoPE op.
+    # No-op on CPU; skip to keep CPU-path tests fast.
+    if os.environ.get("VLLM_TRIATT_HOOK_SYNC", "1") == "1":
+        if torch.cuda.is_available() and q.device.type == "cuda":
+            torch.cuda.synchronize(device=q.device)
 
 
 def _capture_q_fake(q: torch.Tensor, layer_idx: int) -> None:
