@@ -48,6 +48,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.v1.attention.triattention.hooks import capture_q_pre_rope
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -181,6 +182,8 @@ class Llama4Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = extract_layer_index(prefix)
+        # TriAttention V3 layer index (mirrors Llama/Qwen pattern).
+        self._triatt_layer_idx = self.layer_idx
         self.hidden_size = hidden_size
         self.no_rope_layers = config.no_rope_layers
         self.nope = self.no_rope_layers[self.layer_idx] == 0
@@ -282,6 +285,12 @@ class Llama4Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # TriAttention V3 Q capture (pre-RoPE). No-op when V3 is disabled.
+        # Llama 4 iRoPE: 3-of-4 layers run chunked-local RoPE here; the
+        # 1-of-4 NoPE/global layers skip rotary_emb but pre-RoPE == post-RoPE
+        # for them, so the same capture point works for both kinds.
+        capture_q_pre_rope(self._triatt_layer_idx, q)
 
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
